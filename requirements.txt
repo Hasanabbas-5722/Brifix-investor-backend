@@ -1,0 +1,31 @@
+flask
+flask-pymongo
+pymongo
+yfinance
+python-dotenv
+flask-socketio
+eventlet
+python-socketio[asyncio-client]
+pyotp
+smartapi-python
+bcrypt
+PyJWT
+numPy
+pandas
+yahoo_fin
+nse[local] #for local usage
+nse[server] #for prod usage 
+newsapi-python
+yfinance 
+pandas 
+numpy 
+scikit-learn 
+xgboost 
+statsmodels 
+ta 
+rich 
+tensorflow
+logzero
+growwapi
+websocket-client
+flask-cors

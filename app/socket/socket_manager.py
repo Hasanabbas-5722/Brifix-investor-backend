@@ -1,0 +1,1 @@
+active_smartapi_sockets = {}
