@@ -1,9 +1,4 @@
 {
-  "functions": {
-    "run.py": {
-      "runtime": "@vercel/python"
-    }
-  },
   "routes": [
     {
       "src": "/(.*)",
