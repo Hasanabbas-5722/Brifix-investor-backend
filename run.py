@@ -15,6 +15,13 @@ CORS(app, origins=[
     "*"
 ])
 
+@app.route("/health", methods=['GET'])
+def Health():
+    return {
+        "service": "Brifix-Investor-Backend",
+        "Status": "Running",
+    },200
+
 if __name__ == "__main__":
     print("Starting Flask-SocketIO server with eventlet...")
     socketio.run(
