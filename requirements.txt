@@ -29,3 +29,4 @@ logzero
 growwapi
 websocket-client
 flask-cors
+gunicorn
