@@ -1,2 +1,2 @@
-[tool.vercel]
-entrypoint = "run:app"
+[project]
+requires-python = ">=3.11,<3.12"
