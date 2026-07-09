@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: brifix_backend
+    ports:
+      - "6001:6001"
+    # Using volumes to sync your local code with the container during development
+    volumes:
+      - .:/app
+      # Exclude venv if you have it locally so it doesn't conflict with container's python env
+      - /app/venv
+    environment:
+      # Pass any environment variables you might have in your .env file
+      - FLASK_ENV=production
+    env_file:
+      - .env
+    restart: unless-stopped
