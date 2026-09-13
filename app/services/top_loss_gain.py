@@ -1,357 +1,268 @@
-from logging import exception
-from flask import request, jsonify
-from app.utils.logger import get_logger
-import requests
-from nse import NSE
+import time
+from urllib.parse import urlparse
 from pathlib import Path
 import yfinance as yf
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
+from nse import NSE
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
-def get_website_logo(website_url):
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/136.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,"
-            "image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://www.google.com/",
-        "Connection": "keep-alive",
-    }
-
-    try:
-
-        logger.info(f"website of logo :::: {website_url}")
-        response = requests.get(
-            website_url,
-            headers=headers,
-            timeout=10
-        )
-        logger.info(f"website of logo :::: {response.status_code}")
-        if response.status_code != 200:
-            # logger.error(f"Website not reachable: {response.status_code}")
-            domain = urlparse(website_url).netloc
-
-            logo_url = (
-                f"https://www.google.com/s2/favicons"
-                f"?domain={domain}&sz=256"
-            )
-
-            # print(logo_url)
-            return logo_url
-
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        logo = None
-
-        # =========================
-        # METHOD 1 - og:image
-        # =========================
-
-        og = soup.find("meta", property="og:image")
-
-        if og and og.get("content"):
-
-            logo = og.get("content")
-
-            # logger.info(f"Found og:image => {logo}")
-
-            return urljoin(website_url, logo)
-
-        # =========================
-        # METHOD 2 - twitter:image
-        # =========================
-
-        twitter = soup.find("meta", attrs={"name": "twitter:image"})
-
-        if twitter and twitter.get("content"):
-
-            logo = twitter.get("content")
-
-            # logger.info(f"Found twitter:image => {logo}")
-
-            return urljoin(website_url, logo)
-
-        # =========================
-        # METHOD 3 - favicon icon
-        # =========================
-
-        favicon = soup.find(
-            "link",
-            rel=lambda x: x and "icon" in x.lower()
-        )
-
-        if favicon and favicon.get("href"):
-
-            logo = favicon.get("href")
-
-            # logger.info(f"Found favicon => {logo}")
-
-            return urljoin(website_url, logo)
-
-        # =========================
-        # METHOD 4 - apple-touch-icon
-        # =========================
-
-        apple = soup.find(
-            "link",
-            rel=lambda x: x and "apple-touch-icon" in x.lower()
-        )
-
-        if apple and apple.get("href"):
-
-            logo = apple.get("href")
-
-            # logger.info(f"Found apple-touch-icon => {logo}")
-
-            return urljoin(website_url, logo)
-
-        # =========================
-        # METHOD 5 - shortcut icon
-        # =========================
-
-        shortcut = soup.find(
-            "link",
-            rel=lambda x: x and "shortcut icon" in x.lower()
-        )
-
-        if shortcut and shortcut.get("href"):
-
-            logo = shortcut.get("href")
-
-            # logger.info(f"Found shortcut icon => {logo}")
-
-            return urljoin(website_url, logo)
-
-        # =========================
-        # METHOD 6 - default favicon.ico
-        # =========================
-
-        favicon_ico = urljoin(website_url, "/favicon.ico")
-
-        check = requests.get(
-            favicon_ico,
-            headers=headers,
-            timeout=5
-        )
-
-        if check.status_code == 200:
-
-            # logger.info(f"Found favicon.ico => {favicon_ico}")
-
-            return favicon_ico
-
-        # =========================
-        # METHOD 7 - manifest.json
-        # =========================
-
-        manifest = soup.find("link", rel="manifest")
-
-        if manifest and manifest.get("href"):
-
-            manifest_url = urljoin(
-                website_url,
-                manifest.get("href")
-            )
-
-            manifest_response = requests.get(
-                manifest_url,
-                headers=headers,
-                timeout=5
-            )
-
-            if manifest_response.status_code == 200:
-
-                manifest_json = manifest_response.json()
-
-                icons = manifest_json.get("icons", [])
-
-                if icons:
-
-                    icon = icons[0].get("src")
-
-                    if icon:
-
-                        # logger.info(f"Found manifest icon => {icon}")
-
-                        return urljoin(website_url, icon)
-
-        # =========================
-        # METHOD 8 - Clearbit fallback
-        # =========================
-
-        domain = website_url.replace("https://", "").replace(
-            "http://",
-            ""
-        ).split("/")[0]
-
-        clearbit_logo = (
-            f"https://logo.clearbit.com/{domain}"
-        )
-
-        # logger.info(f"Using Clearbit fallback => {clearbit_logo}")
-
-        return clearbit_logo
-
-    except Exception as e:
-
-        logger.error(f"Logo extraction failed: {e}")
-
-        return None
-
 DIR = Path(__file__).parent
 
-nse = NSE(download_folder=DIR)
-nifty_list = nse.listEquityStocksByIndex(index='NIFTY 50')
-banknifty_list = nse.listEquityStocksByIndex(index='NIFTY BANK')
+COMMON_DOMAINS = {
+    "RELIANCE": "ril.com",
+    "TCS": "tcs.com",
+    "HDFCBANK": "hdfcbank.com",
+    "ICICIBANK": "icicibank.com",
+    "INFY": "infosys.com",
+    "SBIN": "sbi.co.in",
+    "BHARTIARTL": "airtel.in",
+    "ITC": "itcportal.com",
+    "KOTAKBANK": "kotak.com",
+    "LT": "larsentoubro.com",
+    "AXISBANK": "axisbank.com",
+    "BAJFINANCE": "bajajfinserv.in",
+    "MARUTI": "marutisuzuki.com",
+    "TATAMOTORS": "tatamotors.com",
+    "SUNPHARMA": "sunpharma.com",
+    "WIPRO": "wipro.com",
+    "HCLTECH": "hcltech.com",
+    "ADANIENT": "adanienterprises.com",
+    "ADANIPORTS": "adaniports.com",
+    "NTPC": "ntpc.co.in",
+    "POWERGRID": "powergrid.in",
+    "TITAN": "titancompany.in",
+    "NESTLEIND": "nestle.in",
+    "TATASTEEL": "tatasteel.com",
+    "ONGC": "ongcindia.com",
+    "JSWSTEEL": "jsw.in",
+    "M&M": "mahindra.com",
+    "COALINDIA": "coalindia.in",
+    "BAJAJFINSV": "bajajfinserv.in",
+    "TECHM": "techmahindra.com",
+    "HINDALCO": "hindalco.com",
+    "INDUSINDBK": "indusind.com",
+    "DRREDDY": "drreddys.com",
+    "DIVISLAB": "divislabs.com",
+    "CIPLA": "cipla.com",
+    "EICHERMOT": "eicher.in",
+    "GRASIM": "grasim.com",
+    "APOLLOHOSP": "apollohospitals.com",
+    "BPCL": "bharatpetroleum.in",
+    "HEROMOTOCO": "heromotocorp.com",
+    "TATACONSUM": "tataconsumer.com",
+    "SBILIFE": "sbilife.co.in",
+    "BRITANNIA": "britannia.co.in",
+    "BAJAJ-AUTO": "bajajauto.com",
+    "HDFCLIFE": "hdfclife.com",
+    "BANKBARODA": "bankofbaroda.in",
+    "PNB": "pnbindia.in",
+    "FEDERALBNK": "federalbank.co.in",
+    "IDFCFIRSTB": "idfcfirstbank.com",
+    "BANDHANBNK": "bandhanbank.com",
+    "AUBANK": "aubank.in",
+}
+
+def get_stock_logo(symbol, website=""):
+    """Instant logo lookup without external scraping overhead."""
+    clean_sym = symbol.replace(".NS", "").replace(".BO", "").strip().upper()
+    domain = COMMON_DOMAINS.get(clean_sym)
+    if not domain and website:
+        try:
+            domain = urlparse(website).netloc
+        except Exception:
+            domain = ""
+    if domain:
+        return f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+    return f"https://ui-avatars.com/api/?name={clean_sym[:4]}&background=4f46e5&color=ffffff&bold=true&size=128"
+
+
+_CACHE = {
+    "nifty_gainers": {"data": [], "timestamp": 0},
+    "banknifty_gainers": {"data": [], "timestamp": 0},
+    "nifty_losers": {"data": [], "timestamp": 0},
+    "banknifty_losers": {"data": [], "timestamp": 0},
+}
+CACHE_TTL = 60  # seconds
+
+_nse_instance = None
+
+def get_nse():
+    global _nse_instance
+    if _nse_instance is None:
+        try:
+            _nse_instance = NSE(download_folder=DIR)
+        except Exception as e:
+            logger.error(f"Failed to initialize NSE: {e}")
+    return _nse_instance
+
 
 class TopGainnerLosserervice:
-    def __init__(self):
-        pass
-    
-    def get_nifty_gainner():
-        try:            
-            logger.info(f"Enter get nifty gainner function :::::::")
-            # Working directory
-            # list = nse.listEquityStocksByIndex(index='NIFTY 50')
-            banknifty_losser_list = nse.gainers(data=nifty_list)
-            # logger.info(f"list :::: {list}")
-            stock_list = []
-            for item in banknifty_losser_list[0:11]:
-                # logger.info(f"symbol ::: {item["symbol"]}")
-                # logger.info(f"symbol data ::: {item}")
-
-                if not "NIFTY 50" in item["symbol"]:
-                    # logger.info(f"symbol full :: {item["symbol"] + ".NS"}")
-                    stock = yf.Ticker(item["symbol"] + ".NS")
-                    # logger.info(f"stock ::: {stock.info["website"]}")
-                    logo = get_website_logo(stock.info["website"])
-                    # if stock.info["website"]:
-
-                    #     domain = urlparse(
-                    #         stock.info["website"]
-                    #     ).netloc
-
-                    #     # FASTEST METHOD
-                    #     logo_url = (
-                    #         f"https://www.google.com/s2/favicons"
-                    #         f"?domain={domain}&sz=256"
-                    #     )
-
-                    # print("Logo:", logo)
-                    stock.info["logo"] = logo
-                    item['stockinfo'] = stock.info
-                    
-                    stock_list.append(item)
-
-            # logger.info(f"stock list of nse api ===>{stock_list}")
-            # logger.info(f"status of nse api ===>{status}")
-
-            nse.exit() # close requests session
-            return stock_list
-        except Exception as e:
-            logger.info(f"Error from top nifty services : {e}")
-            return str(e)
-
-    
-    def get_banknifty_gainner():
-        try:
-            logger.info(f"Enter get bank nifty gainner function :::::::")
-             # Working directory
-            # list = nse.listEquityStocksByIndex(index='NIFTY 50')
-            banknifty_losser_list = nse.gainers(data=banknifty_list)
-            # logger.info(f"list :::: {list}")
-            stock_list = []
-            for item in banknifty_losser_list[0:11]:
-                # logger.info(f"symbol ::: {item["symbol"]}")
-                # logger.info(f"symbol data ::: {item}")
-
-                if not "NIFTY BANK" in item["symbol"]:
-                    # logger.info(f"symbol full :: {item["symbol"] + ".NS"}")
-                    stock = yf.Ticker(item["symbol"] + ".NS")
-                    # logger.info(f"stock ::: {stock.info["website"]}")
-                    logo = get_website_logo(stock.info["website"])
-                    # print("Logo:", logo)
-                    stock.info["logo"] = logo
-                    item['stockinfo'] = stock.info
-                    
-                    stock_list.append(item)
-            nse.exit() # close requests session
-            return stock_list
-        except Exception as e:
-            logger.info(f"Error from get banknifty gainner :: {e}")
-        # end try
+    """Fast, cached service for top market gainers and losers."""
 
     @staticmethod
-    def get_nifty_losser():
+    def _fetch_from_yfinance(symbols):
+        """Fallback when NSE API is unavailable (e.g. outside market hours)."""
+        results = []
         try:
-            logger.info(f"Enter get nifty losser function :::::::")
-             # Working directory
-            # list = nse.listEquityStocksByIndex(index='NIFTY 50')
-            # logger.info(f"list :::: {list}")
-            banknifty_losser_list = nse.losers(data=nifty_list)
-            # logger.info(f"nifty losers list ::: {banknifty_losser_list}")
-            stock_list = []
-            for item in banknifty_losser_list[0:11]:
-                # logger.info(f"symbol ::: {item["symbol"]}")
-                # logger.info(f"symbol data ::: {item}")
+            tickers = [f"{s}.NS" for s in symbols]
+            data = yf.download(tickers, period="2d", progress=False, group_by="ticker")
+            for sym in symbols:
+                ticker_sym = f"{sym}.NS"
+                if ticker_sym in data:
+                    sub = data[ticker_sym]
+                    if len(sub) >= 2:
+                        prev_close = float(sub["Close"].iloc[-2])
+                        curr_close = float(sub["Close"].iloc[-1])
+                        p_change = round(((curr_close - prev_close) / prev_close) * 100, 2)
+                        results.append({
+                            "symbol": sym,
+                            "stockSymbol": sym,
+                            "companyName": sym,
+                            "ltp": round(curr_close, 2),
+                            "lastPrice": round(curr_close, 2),
+                            "pChange": p_change,
+                            "previousClose": round(prev_close, 2),
+                            "logo": get_stock_logo(sym),
+                            "stockinfo": {
+                                "shortName": sym,
+                                "logo": get_stock_logo(sym),
+                            }
+                        })
+        except Exception as e:
+            logger.error(f"yfinance fallback error: {e}")
+        return results
 
-                if not "NIFTY 50" in item["symbol"]:
-                    # logger.info(f"symbol full :: {item["symbol"] + ".NS"}")
-                    stock = yf.Ticker(item["symbol"] + ".NS")
-                    # logger.info(f"stock ::: {stock.info["website"]}")
-                    logo = get_website_logo(stock.info["website"])
-                    # print("Logo:", logo)
-                    stock.info["logo"] = logo
-                    item['stockinfo'] = stock.info
-                    
-                    stock_list.append(item)
-            nse.exit() # close requests session
-            # logger.info(f"list of nifty losser ====> {stock_list}")
+    @staticmethod
+    def get_nifty_gainner(user_data=None):
+        now = time.time()
+        if _CACHE["nifty_gainers"]["data"] and (now - _CACHE["nifty_gainers"]["timestamp"] < CACHE_TTL):
+            return _CACHE["nifty_gainers"]["data"]
+
+        try:
+            nse = get_nse()
+            stock_list = []
+            if nse:
+                nifty_list = nse.listEquityStocksByIndex(index='NIFTY 50')
+                gainers = nse.gainers(data=nifty_list)
+                for item in (gainers or [])[:10]:
+                    sym = item.get("symbol", "")
+                    if "NIFTY" not in sym:
+                        item["logo"] = get_stock_logo(sym)
+                        item["stockinfo"] = {
+                            "shortName": item.get("symbol", ""),
+                            "logo": item["logo"]
+                        }
+                        stock_list.append(item)
+
+            if not stock_list:
+                sample = ["ADANIENT", "TATAMOTORS", "BHARTIARTL", "RELIANCE", "SBIN"]
+                stock_list = TopGainnerLosserervice._fetch_from_yfinance(sample)
+                stock_list.sort(key=lambda x: x.get("pChange", 0), reverse=True)
+
+            _CACHE["nifty_gainers"] = {"data": stock_list, "timestamp": now}
             return stock_list
         except Exception as e:
-            logger.info(f"Error from get banknifty lossser :: {e}")
-        # end try
+            logger.error(f"Error in get_nifty_gainner: {e}")
+            return _CACHE["nifty_gainers"]["data"] or []
 
-    
-    def get_banknifty_losser():
+    @staticmethod
+    def get_banknifty_gainner(user_data=None):
+        now = time.time()
+        if _CACHE["banknifty_gainers"]["data"] and (now - _CACHE["banknifty_gainers"]["timestamp"] < CACHE_TTL):
+            return _CACHE["banknifty_gainers"]["data"]
+
         try:
-            logger.info(f"Enter get bank nifty losser function :::::::")
-             # Working directory
-            banknifty_losser_list = nse.losers(data=banknifty_list)
-            # logger.info(f"banknifty losers list ::: {banknifty_losser_list}")
-            # logger.info(f"list :::: {list}")
+            nse = get_nse()
             stock_list = []
-            for item in banknifty_losser_list[1:11]:
-                # logger.info(f"symbol ::: {item["symbol"]}")
-                # logger.info(f"symbol data ::: {item}")
+            if nse:
+                banknifty_list = nse.listEquityStocksByIndex(index='NIFTY BANK')
+                gainers = nse.gainers(data=banknifty_list)
+                for item in (gainers or [])[:10]:
+                    sym = item.get("symbol", "")
+                    if "NIFTY" not in sym:
+                        item["logo"] = get_stock_logo(sym)
+                        item["stockinfo"] = {
+                            "shortName": item.get("symbol", ""),
+                            "logo": item["logo"]
+                        }
+                        stock_list.append(item)
 
-                if not "NIFTY BANK" in item["symbol"]:
-                    # logger.info(f"symbol full :: {item["symbol"] + ".NS"}")
-                    stock = yf.Ticker(item["symbol"] + ".NS")
-                    # logger.info(f"stock ::: {stock.info["website"]}")
-                    logo = get_website_logo(stock.info["website"])
-                    # print("Logo:", logo)
-                    stock.info["logo"] = logo
-                    item['stockinfo'] = stock.info
-                    
-                    stock_list.append(item)
-            nse.exit() # close requests session
+            if not stock_list:
+                sample = ["ICICIBANK", "AXISBANK", "SBIN", "KOTAKBANK", "HDFCBANK"]
+                stock_list = TopGainnerLosserervice._fetch_from_yfinance(sample)
+                stock_list.sort(key=lambda x: x.get("pChange", 0), reverse=True)
+
+            _CACHE["banknifty_gainers"] = {"data": stock_list, "timestamp": now}
             return stock_list
         except Exception as e:
-            logger.info(f"Error from get banknifty losser :: {e}")
-        # end try
+            logger.error(f"Error in get_banknifty_gainner: {e}")
+            return _CACHE["banknifty_gainers"]["data"] or []
+
+    @staticmethod
+    def get_nifty_losser(user_data=None):
+        now = time.time()
+        if _CACHE["nifty_losers"]["data"] and (now - _CACHE["nifty_losers"]["timestamp"] < CACHE_TTL):
+            return _CACHE["nifty_losers"]["data"]
+
+        try:
+            nse = get_nse()
+            stock_list = []
+            if nse:
+                nifty_list = nse.listEquityStocksByIndex(index='NIFTY 50')
+                losers = nse.losers(data=nifty_list)
+                for item in (losers or [])[:10]:
+                    sym = item.get("symbol", "")
+                    if "NIFTY" not in sym:
+                        item["logo"] = get_stock_logo(sym)
+                        item["stockinfo"] = {
+                            "shortName": item.get("symbol", ""),
+                            "logo": item["logo"]
+                        }
+                        stock_list.append(item)
+
+            if not stock_list:
+                sample = ["WIPRO", "INFY", "SUNPHARMA", "NESTLEIND", "HDFCBANK"]
+                stock_list = TopGainnerLosserervice._fetch_from_yfinance(sample)
+                stock_list.sort(key=lambda x: x.get("pChange", 0))
+
+            _CACHE["nifty_losers"] = {"data": stock_list, "timestamp": now}
+            return stock_list
+        except Exception as e:
+            logger.error(f"Error in get_nifty_losser: {e}")
+            return _CACHE["nifty_losers"]["data"] or []
+
+    @staticmethod
+    def get_banknifty_losser(user_data=None):
+        now = time.time()
+        if _CACHE["banknifty_losers"]["data"] and (now - _CACHE["banknifty_losers"]["timestamp"] < CACHE_TTL):
+            return _CACHE["banknifty_losers"]["data"]
+
+        try:
+            nse = get_nse()
+            stock_list = []
+            if nse:
+                banknifty_list = nse.listEquityStocksByIndex(index='NIFTY BANK')
+                losers = nse.losers(data=banknifty_list)
+                for item in (losers or [])[:10]:
+                    sym = item.get("symbol", "")
+                    if "NIFTY" not in sym:
+                        item["logo"] = get_stock_logo(sym)
+                        item["stockinfo"] = {
+                            "shortName": item.get("symbol", ""),
+                            "logo": item["logo"]
+                        }
+                        stock_list.append(item)
+
+            if not stock_list:
+                sample = ["BANDHANBNK", "IDFCFIRSTB", "FEDERALBNK", "PNB", "BANKBARODA"]
+                stock_list = TopGainnerLosserervice._fetch_from_yfinance(sample)
+                stock_list.sort(key=lambda x: x.get("pChange", 0))
+
+            _CACHE["banknifty_losers"] = {"data": stock_list, "timestamp": now}
+            return stock_list
+        except Exception as e:
+            logger.error(f"Error in get_banknifty_losser: {e}")
+            return _CACHE["banknifty_losers"]["data"] or []
 
     

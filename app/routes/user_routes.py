@@ -8,6 +8,27 @@ logger = get_logger(__name__)
 user_bp = Blueprint("user", __name__, url_prefix="/api/v1/users")
 
 
+@user_bp.route('/register', methods=['POST'])
+def user_register():
+    user_data = request.get_json(silent=True) or {}
+    logger.info(f"user_register data: {user_data.get('email')}")
+
+    name = user_data.get("name", "").strip()
+    email = user_data.get("email", "").strip()
+    password = user_data.get("password", "")
+    phone = user_data.get("phone", "")
+
+    if not email or not password:
+        return jsonify({"status": "failed", "message": "Email and password are required"}), 400
+
+    if not name:
+        name = email.split("@")[0]
+
+    user_response, status_code = UserService.register(name, email, password, phone)
+    user_response = serialize_mongo(user_response)
+    return jsonify(user_response), status_code
+
+
 @user_bp.route('/login', methods=['POST'])
 def user_login():
     user_data = request.get_json(silent=True) or {}

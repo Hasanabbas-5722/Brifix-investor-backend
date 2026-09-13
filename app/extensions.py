@@ -30,7 +30,7 @@ client = None
 def connect_to_mongodb():
     """Establish a standalone MongoDB connection."""
     global client
-    mongo_uri = os.environ.get("MONGO_URI", "mongodb+srv://brifixinvestor:donsaale5722@brifix-investor.g7snl.mongodb.net/")
+    mongo_uri = os.environ.get("MONGO_URI", "mongodb+srv://brifixinvestor:Donsaale5722@brifix-investor.g7snl.mongodb.net/?appName=brifix-investor")
     logger.info(f"client ==> {str(client)}")
     try:
         if client is not None:
@@ -44,8 +44,8 @@ def connect_to_mongodb():
         client = client["brifix-investor"]
 
         return client
-    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-        logger.info(f"✗ Failed to connect to MongoDB: {e}")
+    except Exception as e:
+        logger.error(f"✗ Failed to connect to MongoDB: {e}")
         return None
 
 def _is_session_expired() -> bool:

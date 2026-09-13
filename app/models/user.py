@@ -41,12 +41,49 @@ class User:
         """Find user by email"""
         logger.info(f"email : {email}")
         user_data = db.users.find_one({"email": email})
-        logger.info(f"user dta :::: {user_data}")
-        user_data["id"] = str(user_data["_id"])
-
+        logger.info(f"user data :::: {user_data}")
         if not user_data:
             return None
+        user_data["id"] = str(user_data["_id"])
         return user_data
+
+    @staticmethod
+    def create_user(name, email, password_hash, phone=None):
+        """Create a new user in MongoDB"""
+        try:
+            doc = {
+                "name": name,
+                "email": email,
+                "password": password_hash,
+                "phone": phone,
+                "isAdmin": False,
+                "is_active": True,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            result = db.users.insert_one(doc)
+            doc["_id"] = result.inserted_id
+            doc["id"] = str(result.inserted_id)
+            return doc
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
+            return None
+
+    @staticmethod
+    def update_token(id, jwt_token):
+        """Update user accessToken only"""
+        try:
+            result = db.users.update_one(
+                {"_id": ObjectId(id)},
+                {"$set": {
+                    "accessToken": jwt_token,
+                    "updatedAt": datetime.utcnow()
+                }}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating user token: {e}")
+            return False
 
     @staticmethod
     def update(angle_jwt_token, angle_refresh_token, angle_feed_token, id, jwt_token):
@@ -67,14 +104,20 @@ class User:
             logger.error(f"Error updating user: {e}")
             return False
 
+    @staticmethod
     def find_user_by_user_id(id):
         """Find user by id"""
-        logger.info(f"id : {id}")
-        user_data = db.users.find_one({"_id": ObjectId(id)})
-        user_data["_id"] = str(user_data["_id"])
-        if not user_data:
+        try:
+            logger.info(f"id : {id}")
+            user_data = db.users.find_one({"_id": ObjectId(id)})
+            if not user_data:
+                return None
+            user_data["_id"] = str(user_data["_id"])
+            user_data["id"] = str(user_data["_id"])
+            return user_data
+        except Exception as e:
+            logger.error(f"Error finding user by id: {e}")
             return None
-        return user_data
     
     @staticmethod
     def update_password(email, new_password):

@@ -11,7 +11,13 @@ from app.models.order import Orders
 
 logger = get_logger(__name__)
 
-groww = get_groww_client()
+
+def _get_client():
+    try:
+        return get_groww_client()
+    except Exception as e:
+        logger.warning(f"Could not connect to Groww: {e}")
+        return None
 
 
 class Groww:
@@ -20,6 +26,9 @@ class Groww:
 
     def GetRMS(data):
         try:
+            groww = _get_client()
+            if not groww:
+                return None, None
             logger.info(f"get active_smart_groww_sessions :::: {groww}")
 
             get_profile = groww.get_user_profile()
@@ -38,20 +47,16 @@ class Groww:
 
     def GetOrderList():
         try:
-            # get_order_list = groww.get_order_list(
-            #     page = 0, # Optional: Page number for paginated results
-            #     page_size = 100 # Optional: Number of orders to fetch per page (default is 100)
-            # )
-            # logger.info(f"get order list :::: {get_order_list}")
-            # for item in get_order_list:
-            #     Orders.add_orders(item)
+            groww = _get_client()
+            if not groww:
+                return "Groww client unavailable"
             quote_response = groww.get_quote(
                 exchange=groww.EXCHANGE_NSE,
                 segment=groww.SEGMENT_CASH,
                 trading_symbol="NIFTY"
             )
             logger.info(f"quotes response =====> {quote_response}")
-            return 
+            return quote_response
         except Exception as e:
             logger.info(f"Error from get order list ::: {str(e)}")
             return str(e)

@@ -1,3 +1,11 @@
+import os
+import sys
+
+# On macOS, eventlet's default kqueue hub encounters kevent incompatibilities with Python 3.9+
+# Setting EVENTLET_HUB to 'selects' ensures stable asynchronous I/O
+if sys.platform == "darwin":
+    os.environ.setdefault("EVENTLET_HUB", "selects")
+
 import eventlet
 eventlet.monkey_patch()
 
@@ -14,13 +22,6 @@ app = create_app()
 CORS(app, origins=[
     "*"
 ])
-
-@app.route("/health", methods=['GET'])
-def Health():
-    return {
-        "service": "Brifix-Investor-Backend",
-        "Status": "Running",
-    },200
 
 if __name__ == "__main__":
     print("Starting Flask-SocketIO server with eventlet...")

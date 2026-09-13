@@ -37,6 +37,71 @@ chart_stop_flags = {}
 _chart_symbol_clients = {}  # { symbol: set(client_sids) }
 
 
+_fallback_feeder_running = False
+_feeder_lock = threading.Lock()
+
+def _run_index_feeder():
+    """Background index broadcaster for clients in the 'indexes' room."""
+    global _fallback_feeder_running
+    import yfinance as yf
+    logger.info("Starting background index broadcaster...")
+    while _fallback_feeder_running:
+        try:
+            nifty = yf.Ticker("^NSEI")
+            fast_nifty = nifty.fast_info
+            nifty_ltp = float(fast_nifty.get('lastPrice', 0) or 0)
+            nifty_prev = float(fast_nifty.get('previousClose', 0) or nifty_ltp)
+            nifty_open = float(fast_nifty.get('open', 0) or nifty_prev)
+
+            if nifty_ltp > 0:
+                socketio.emit(
+                    "indexes_data",
+                    {
+                        "token": "99926000",
+                        "ltp": nifty_ltp,
+                        "full_data": {
+                            "last_traded_price": round(nifty_ltp * 100),
+                            "closed_price": round(nifty_prev * 100),
+                            "open_price_of_the_day": round(nifty_open * 100),
+                        }
+                    },
+                    room='indexes'
+                )
+
+            bank = yf.Ticker("^NSEBANK")
+            fast_bank = bank.fast_info
+            bank_ltp = float(fast_bank.get('lastPrice', 0) or 0)
+            bank_prev = float(fast_bank.get('previousClose', 0) or bank_ltp)
+            bank_open = float(fast_bank.get('open', 0) or bank_prev)
+
+            if bank_ltp > 0:
+                socketio.emit(
+                    "indexes_data",
+                    {
+                        "token": "99926009",
+                        "ltp": bank_ltp,
+                        "full_data": {
+                            "last_traded_price": round(bank_ltp * 100),
+                            "closed_price": round(bank_prev * 100),
+                            "open_price_of_the_day": round(bank_open * 100),
+                        }
+                    },
+                    room='indexes'
+                )
+        except Exception as e:
+            logger.error(f"Error in background index broadcaster: {e}")
+
+        time.sleep(3)
+
+def ensure_index_feeder():
+    global _fallback_feeder_running
+    with _feeder_lock:
+        if not _fallback_feeder_running:
+            _fallback_feeder_running = True
+            t = threading.Thread(target=_run_index_feeder, daemon=True)
+            t.start()
+
+
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection"""
@@ -46,7 +111,7 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """Handle client disconnection"""
+    """Handle client disconnection with complete cleanup"""
     logger.info(f"Client disconnected: {request.sid}")
 
     # Clean up index streams
@@ -62,97 +127,76 @@ def handle_disconnect():
     for sym, clients in _chart_symbol_clients.items():
         clients.discard(request.sid)
 
-@socketio.on('disconnect')
-def handle_disconnect():
-
-    logger.info(f"Client disconnected: {request.sid}")
-
     user = getattr(request, "user", None)
+    if user:
+        client_code = user.get("angleClientCode")
+        if client_code and client_code in active_smartapi_sockets:
+            logger.info(f"Cleaning SmartAPI socket: {client_code}")
+            try:
+                active_smartapi_sockets[client_code].disconnect()
+            except Exception:
+                pass
+            active_smartapi_sockets.pop(client_code, None)
 
-    if not user:
-        return
-
-    client_code = user.get("angleClientCode")
-
-    if client_code in active_smartapi_sockets:
-
-        logger.info(
-            f"Cleaning SmartAPI socket: {client_code}"
-        )
-
-        active_smartapi_sockets[
-            client_code
-        ].disconnect()
-
-        del active_smartapi_sockets[
-            client_code
-        ]
 
 # ──────────────────────────────────────────────────
-# Index price streaming (Angel One real-time)
+# Index price streaming (Real-time)
 # ──────────────────────────────────────────────────
 
 @socketio.on("subscribe_indexes")
-@validate_access_token
-def handle_subscribe_indexes(data):
-    """Handle subscription to index updates via Angel One SmartAPI WebSocket."""
-    logger.info(f"Client {request.sid} subscribed to indexes: {request.user}")
-    logger.info(f"data: {data}")
+def handle_subscribe_indexes(data=None):
+    """Handle subscription to index updates with fallback for non-broker users."""
+    logger.info(f"Client {request.sid} subscribed to indexes: {data}")
     join_room('indexes')
+    ensure_index_feeder()
 
-    # yahoo_tokens = data.get('tokens', [])
-    client_code = request.user['angleClientCode']
+    user = getattr(request, "user", {}) or {}
+    client_code = user.get('angleClientCode')
 
-    if client_code in active_smartapi_sockets:
+    if not client_code:
+        emit("indexes_status", {"status": "subscribed", "mode": "stream_active"})
+        return
 
-        logger.info(
-            f"Using existing websocket for {client_code}"
-        )
+    try:
+        if client_code in active_smartapi_sockets:
+            logger.info(f"Using existing SmartAPI websocket for {client_code}")
+            a1_socket = active_smartapi_sockets[client_code]
+        else:
+            logger.info(f"Creating NEW SmartAPI websocket for {client_code}")
+            smartapi_connect = SmartAPISocket.on_connect(
+                client_code,
+                user.get("angleClientPin"),
+                user.get("angleTotpSecret"),
+                user.get("angleApiKey")
+            )
 
-        a1_socket = active_smartapi_sockets[client_code]
+            if not isinstance(smartapi_connect, dict) or not smartapi_connect.get("data"):
+                logger.warning("Could not obtain SmartAPI session, using default stream.")
+                return
 
-    else:
+            jwt_token = smartapi_connect["data"].get("jwtToken", "")
+            if jwt_token.startswith("Bearer "):
+                jwt_token = jwt_token.split(" ")[1]
 
-        logger.info(
-            f"Creating NEW websocket for {client_code}"
-        )
+            feed_token = smartapi_connect["data"].get("feedToken", "")
+            tokens_to_sub = data.get("tokens", []) if (data and isinstance(data, dict)) else []
 
-        smartapi_connect = SmartAPISocket.on_connect(
-            client_code,
-            request.user["angleClientPin"],
-            request.user["angleTotpSecret"],
-            request.user["angleApiKey"]
-        )
+            a1_socket = AngelOneWebSocket(
+                jwt_token=jwt_token,
+                api_key=user.get("angleApiKey"),
+                client_code=client_code,
+                feed_token=feed_token,
+                tokens=tokens_to_sub,
+                room='indexes'
+            )
 
-        jwt_token = smartapi_connect["data"]["jwtToken"]
+            active_smartapi_sockets[client_code] = a1_socket
+            a1_socket.connect()
 
-        if jwt_token.startswith("Bearer "):
-            jwt_token = jwt_token.split(" ")[1]
-
-        feed_token = smartapi_connect["data"]["feedToken"]
-
-        a1_socket = AngelOneWebSocket(
-            jwt_token=jwt_token,
-            api_key=request.user["angleApiKey"],
-            client_code=client_code,
-            feed_token=feed_token,
-            tokens= data["tokens"] if data['tokens'] else [],
-            room=request.sid
-        )
-
-            # STORE SOCKET
-        active_smartapi_sockets[client_code] = a1_socket
-
-            # CONNECT ONLY ONCE
-        a1_socket.connect()
-    
-    a1_socket.subscribe_tokens(data["tokens"])
-
-    # emit("indexes_data", {
-    #     "message": "Successfully subscribed to indexes updates",
-    #     "symbols": data['tokens'],
-    #     "data": smartapi_connect
-    # })
+        if data and isinstance(data, dict) and data.get("tokens"):
+            a1_socket.subscribe_tokens(data["tokens"])
+    except Exception as e:
+        logger.error(f"Error subscribing to broker feed: {e}")
 
 INTERVAL_MAP = {
     '1m':  'ONE_MINUTE',

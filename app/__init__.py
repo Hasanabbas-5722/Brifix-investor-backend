@@ -42,8 +42,12 @@ def create_app(config_name=None):
 
     @app.route("/api/v1/market_status", methods=["GET"])
     def market_status():
-        print("nse.status",nse.status())
-        return jsonify({"market_status": nse.status()})
+        try:
+            status = nse.status()
+            return jsonify({"market_status": status})
+        except Exception as e:
+            logger.warning(f"Error fetching market status from NSE: {e}")
+            return jsonify({"market_status": [{"market": "Capital Market", "marketStatus": "Closed"}]})
 
     # Initialize MongoDB
     extensions.connect_to_mongodb()
@@ -52,8 +56,6 @@ def create_app(config_name=None):
     socketio.init_app(app)
     
     logger.info("Socket io connected succesfully ")
-    # SmartAPISocket.on_connect()
-    get_groww_client()
 
     # Register Blueprints
     from .routes.chart_routes import chart_bp

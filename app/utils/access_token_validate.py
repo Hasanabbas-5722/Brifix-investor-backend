@@ -15,67 +15,55 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from flask import jsonify
+
 def validate_access_token(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            logger.info(f"Access token validation wrapper: {args}")
-            logger.info(f"Access token validation wrapper: {kwargs}")
-
-            # Socket payload
-            data = args[0] if args else {}
-
-            logger.info(f"Access token validation data: {data}")
+            # Check for token in socket payload argument or HTTP headers
+            data = args[0] if (args and isinstance(args[0], dict)) else {}
 
             auth_header = (
                 data.get("accessToken")
-                if data
-                else request.headers.get("Authorization")
+                or data.get("token")
+                or request.headers.get("Authorization")
             )
 
-            logger.info(f"Access token validation auth_header: {auth_header}")
-
             if not auth_header:
-                return {"message": "Token missing"}, 401
+                return jsonify({"status": "failed", "message": "Token missing"}), 401
 
-            # Remove Bearer
-            if auth_header.startswith("Bearer "):
-                token = auth_header.split(" ")[1]
+            # Remove Bearer prefix if present
+            if isinstance(auth_header, str) and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ", 1)[1].strip()
             else:
-                token = auth_header
+                token = str(auth_header).strip()
 
-            logger.info(f"Access token validation token: {token}")
-
-            # Decode JWT
+            # Decode JWT with HS256
             decoded = jwt.decode(
                 token,
                 SECRET_KEY,
-                algorithms=["HS256"],
-                options={"verify_signature": False}
+                algorithms=["HS256"]
             )
 
-            logger.info(f"Access token validation decoded: {decoded}")
+            user_id = decoded.get("user_id")
+            if not user_id:
+                return jsonify({"status": "failed", "message": "Invalid token payload"}), 401
 
-            # If DB call is async
-            user_data = User.find_user_by_user_id(decoded["user_id"])
-
+            user_data = User.find_user_by_user_id(user_id)
             if not user_data:
-                return {"message": "Token is not valid"}, 401
-
-            logger.info(f"Access token validation user_data: {user_data}")
+                return jsonify({"status": "failed", "message": "User not found"}), 401
 
             request.user = user_data
-
-            # IMPORTANT
             return func(*args, **kwargs)
 
         except jwt.ExpiredSignatureError:
-            logger.exception("Token expired")
-            return {"message": "Token expired"}, 401
+            logger.warning("Token expired")
+            return jsonify({"status": "failed", "message": "Token expired"}), 401
 
         except Exception as e:
-            logger.exception(f"Token validation error: {e}")
-            return {"message": "Invalid token"}, 401
+            logger.warning(f"Token validation error: {e}")
+            return jsonify({"status": "failed", "message": "Invalid token"}), 401
 
     return wrapper

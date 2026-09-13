@@ -23,6 +23,27 @@ logger = get_logger(__name__)
 predict_bp = Blueprint("predict", __name__, url_prefix="/api/v1")
 
 
+@predict_bp.route("/predict/daily-picks", methods=["GET"])
+@predict_bp.route("/daily-picks", methods=["GET"])
+def daily_stock_picks():
+    """
+    Returns AI suggestions for which stocks to purchase for today.
+    Ranked list of opportunities with Target, Stop Loss, Expected Return, and Confidence.
+    """
+    try:
+        picks = StockPredictionService.get_daily_recommendations()
+        return jsonify({
+            "status": "success",
+            "data": picks
+        })
+    except Exception as e:
+        logger.error(f"[daily_stock_picks] Error: {e}")
+        return jsonify({
+            "status": "failed",
+            "error": str(e)
+        }), 500
+
+
 @predict_bp.route("/predict", methods=["GET"])
 @validate_access_token
 def predict_stock():
