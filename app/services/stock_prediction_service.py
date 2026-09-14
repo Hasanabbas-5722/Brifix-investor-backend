@@ -37,7 +37,22 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-console = Console()
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+console = Console(safe_box=True)
+
+def safe_print(*args, **kwargs):
+    try:
+        console.print(*args, **kwargs)
+    except Exception:
+        pass
 
 # Optional TensorFlow/Keras for LSTM
 try:
@@ -49,7 +64,7 @@ try:
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
-    console.print("  [yellow]⚠[/yellow] TensorFlow not available — LSTM model will be skipped.")
+    safe_print("  [yellow]⚠[/yellow] TensorFlow not available — LSTM model will be skipped.")
 
 
 # ── Feature columns used by ML models ──────────────────────
@@ -88,14 +103,14 @@ class _DataFetcher:
         self.ticker = f"{self.symbol}{suffix}"
 
     def fetch(self, period: str = "2y") -> pd.DataFrame:
-        console.print(f"  [cyan]Fetching[/cyan] [bold]{self.ticker}[/bold] from Yahoo Finance...")
+        safe_print(f"  [cyan]Fetching[/cyan] [bold]{self.ticker}[/bold] from Yahoo Finance...")
         df = yf.download(self.ticker, period=period, auto_adjust=True, progress=False)
         if df.empty:
             raise ValueError(f"No data returned for {self.ticker}. Check the symbol/exchange.")
         df.dropna(inplace=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        console.print(f"  [green]✓[/green] {len(df)} trading days loaded ({df.index[0].date()} → {df.index[-1].date()})")
+        safe_print(f"  [green]✓[/green] {len(df)} trading days loaded ({df.index[0].date()} → {df.index[-1].date()})")
         return df
 
     def get_info(self) -> dict:
@@ -119,7 +134,7 @@ class _DataFetcher:
                 "website":     info.get("website", ""),
             }
         except Exception as e:
-            console.print(f"  [yellow]⚠[/yellow] Could not fetch company info: {e}")
+            safe_print(f"  [yellow]⚠[/yellow] Could not fetch company info: {e}")
             return {"name": self.symbol}
 
 
@@ -308,7 +323,7 @@ class StockPredictionService:
 
         candidates = [
             {"symbol": "RELIANCE",   "name": "Reliance Industries",       "sector": "Energy"},
-            {"symbol": "TATAMOTORS", "name": "Tata Motors Ltd",           "sector": "Automobile"},
+            {"symbol": "TATAMOTORS", "name": "Tata Motors Ltd",           "sector": "Automobile", "ticker": "TMCV.NS"},
             {"symbol": "ICICIBANK",  "name": "ICICI Bank Ltd",            "sector": "Banking"},
             {"symbol": "BHARTIARTL", "name": "Bharti Airtel Ltd",         "sector": "Telecom"},
             {"symbol": "SBIN",       "name": "State Bank of India",       "sector": "Banking"},
@@ -322,12 +337,12 @@ class StockPredictionService:
         scored_picks = []
 
         try:
-            tickers = [f"{c['symbol']}.NS" for c in candidates]
+            tickers = [c.get("ticker", f"{c['symbol']}.NS") for c in candidates]
             data = yf.download(tickers, period="3mo", interval="1d", progress=False, group_by="ticker")
 
             for c in candidates:
                 sym = c["symbol"]
-                t_sym = f"{sym}.NS"
+                t_sym = c.get("ticker", f"{sym}.NS")
                 if t_sym not in data:
                     continue
 
@@ -466,9 +481,9 @@ class StockPredictionService:
                 if now - ts < 900:
                     return entry
 
-            console.print()
-            console.print(Rule(f"[bold cyan]STOCKAI — Prediction for {symbol} ({exchange})[/bold cyan]"))
-            console.print()
+            safe_print()
+            safe_print(Rule(f"[bold cyan]STOCKAI — Prediction for {symbol} ({exchange})[/bold cyan]"))
+            safe_print()
 
             # ── 1. Data ─────────────────────────────────────────
             fetcher = _DataFetcher(symbol, exchange)
@@ -482,25 +497,25 @@ class StockPredictionService:
             # ── 3. Train models ─────────────────────────────────
             Xtr, Xte, ytr, yte, X_live = _split(df_f)
 
-            console.print("  [cyan]Step 1/5[/cyan] Training Random Forest...")
+            safe_print("  [cyan]Step 1/5[/cyan] Training Random Forest...")
             rf_pred, rf_conf   = _random_forest(Xtr, ytr, X_live)
 
-            console.print(f"  [green]✓[/green] Random Forest done — ₹{rf_pred:,.2f} (conf {rf_conf:.1f}%)")
-            console.print("  [cyan]Step 2/5[/cyan] Training XGBoost...")
+            safe_print(f"  [green]✓[/green] Random Forest done — ₹{rf_pred:,.2f} (conf {rf_conf:.1f}%)")
+            safe_print("  [cyan]Step 2/5[/cyan] Training XGBoost...")
             xgb_pred, xgb_conf = _xgboost(Xtr, ytr, Xte, yte, X_live)
 
-            console.print(f"  [green]✓[/green] XGBoost done — ₹{xgb_pred:,.2f} (conf {xgb_conf:.1f}%)")
-            console.print("  [cyan]Step 3/5[/cyan] Training SVR...")
+            safe_print(f"  [green]✓[/green] XGBoost done — ₹{xgb_pred:,.2f} (conf {xgb_conf:.1f}%)")
+            safe_print("  [cyan]Step 3/5[/cyan] Training SVR...")
             svr_pred, svr_conf = _svr(Xtr, ytr, X_live)
 
-            console.print(f"  [green]✓[/green] SVR done — ₹{svr_pred:,.2f} (conf {svr_conf:.1f}%)")
-            console.print("  [cyan]Step 4/5[/cyan] Training ARIMA...")
+            safe_print(f"  [green]✓[/green] SVR done — ₹{svr_pred:,.2f} (conf {svr_conf:.1f}%)")
+            safe_print("  [cyan]Step 4/5[/cyan] Training ARIMA...")
             arima_pred, arima_conf = _arima(df["Close"])
 
             lstm_pred, lstm_conf = None, None
             if TF_AVAILABLE:
-                console.print(f"  [green]✓[/green] ARIMA done — ₹{arima_pred:,.2f} (conf {arima_conf:.1f}%)")
-                console.print("  [cyan]Step 5/5[/cyan] Training LSTM neural network...")
+                safe_print(f"  [green]✓[/green] ARIMA done — ₹{arima_pred:,.2f} (conf {arima_conf:.1f}%)")
+                safe_print("  [cyan]Step 5/5[/cyan] Training LSTM neural network...")
                 lstm_pred, lstm_conf = _lstm(df["Close"])
 
             # ── 4. Ensemble ──────────────────────────────────────
@@ -586,58 +601,92 @@ class StockPredictionService:
                 model_predictions[name] = {
                     "price":       round(pred, 2),
                     "confidence":  round(conf, 2),
+                    "conf":        round(conf, 2),
                     "weight_pct":  round(wt * 100, 1),
                     "change_pct":  round(chg_pct, 2),
+                    "pct":         round(chg_pct, 2),
                 }
 
             technical_signals = [
                 {
                     "indicator": "RSI (14)",
+                    "ind": "RSI (14)",
                     "value": round(rsi_now, 2),
+                    "val": str(round(rsi_now, 2)),
                     "signal": "Oversold→BUY" if rsi_now < 30 else ("Overbought→SELL" if rsi_now > 70 else "Neutral"),
+                    "sig": "Oversold→BUY" if rsi_now < 30 else ("Overbought→SELL" if rsi_now > 70 else "Neutral"),
                     "color": "green" if rsi_now < 40 else ("red" if rsi_now > 70 else "yellow"),
+                    "c": "green" if rsi_now < 40 else ("red" if rsi_now > 70 else "amber"),
                 },
                 {
                     "indicator": "MACD",
+                    "ind": "MACD",
                     "value": round(macd_v, 4),
+                    "val": str(round(macd_v, 4)),
                     "signal": "Bullish" if macd_v > macd_s else "Bearish",
+                    "sig": "Bullish" if macd_v > macd_s else "Bearish",
                     "color": "green" if macd_v > macd_s else "red",
+                    "c": "green" if macd_v > macd_s else "red",
                 },
                 {
                     "indicator": "EMA 20",
+                    "ind": "EMA 20",
                     "value": round(ema20, 2),
+                    "val": str(round(ema20, 2)),
                     "signal": "Above EMA→Bull" if current > ema20 else "Below EMA→Bear",
+                    "sig": "Above EMA→Bull" if current > ema20 else "Below EMA→Bear",
                     "color": "green" if current > ema20 else "red",
+                    "c": "green" if current > ema20 else "red",
                 },
                 {
                     "indicator": "EMA 50",
+                    "ind": "EMA 50",
                     "value": round(ema50, 2),
+                    "val": str(round(ema50, 2)),
                     "signal": "Above EMA→Bull" if current > ema50 else "Below EMA→Bear",
+                    "sig": "Above EMA→Bull" if current > ema50 else "Below EMA→Bear",
                     "color": "green" if current > ema50 else "red",
+                    "c": "green" if current > ema50 else "red",
                 },
                 {
                     "indicator": "ADX",
+                    "ind": "ADX",
                     "value": round(adx, 2),
+                    "val": str(round(adx, 2)),
                     "signal": "Strong Trend" if adx > 25 else "Weak/Ranging",
+                    "sig": "Strong Trend" if adx > 25 else "Weak/Ranging",
                     "color": "green" if adx > 25 else "yellow",
+                    "c": "green" if adx > 25 else "amber",
                 },
                 {
                     "indicator": "Bollinger %B",
+                    "ind": "Bollinger %B",
                     "value": round(bb_pct, 4),
+                    "val": str(round(bb_pct, 4)),
                     "signal": "Overbought" if bb_pct > 0.8 else ("Oversold" if bb_pct < 0.2 else "Normal"),
+                    "sig": "Overbought" if bb_pct > 0.8 else ("Oversold" if bb_pct < 0.2 else "Normal"),
                     "color": "red" if bb_pct > 0.8 else ("green" if bb_pct < 0.2 else "yellow"),
+                    "c": "red" if bb_pct > 0.8 else ("green" if bb_pct < 0.2 else "amber"),
                 },
                 {
                     "indicator": "MFI (14)",
+                    "ind": "MFI (14)",
                     "value": round(mfi, 2),
+                    "val": str(round(mfi, 2)),
                     "signal": "Buying pressure" if mfi > 60 else ("Selling pressure" if mfi < 40 else "Neutral"),
+                    "sig": "Buying pressure" if mfi > 60 else ("Selling pressure" if mfi < 40 else "Neutral"),
                     "color": "green" if mfi > 60 else ("red" if mfi < 40 else "yellow"),
+                    "c": "green" if mfi > 60 else ("red" if mfi < 40 else "amber"),
                 },
                 {
                     "indicator": "Stochastic %K",
+                    "ind": "Stochastic %K",
                     "value": round(stoch, 2),
+                    "val": str(round(stoch, 2)),
                     "signal": "Oversold" if stoch < 20 else ("Overbought" if stoch > 80 else "Neutral"),
+                    "sig": "Oversold" if stoch < 20 else ("Overbought" if stoch > 80 else "Neutral"),
                     "color": "green" if stoch < 30 else ("red" if stoch > 70 else "yellow"),
+                    "c": "green" if stoch < 30 else ("red" if stoch > 70 else "amber"),
                 },
             ]
 
@@ -721,9 +770,9 @@ class StockPredictionService:
             }
 
             sig_color = "green" if "BUY" in overall_signal else ("red" if "SELL" in overall_signal else "yellow")
-            console.print()
-            console.print(f"  [green]✓[/green] Prediction complete for [bold]{symbol}[/bold]")
-            console.print(f"  [bold]CMP:[/bold] ₹{current:,.2f}  →  [bold]Target:[/bold] ₹{ensemble_pred:,.2f}  |  [{sig_color}]{overall_signal}[/{sig_color}]  |  Confidence: {ensemble_conf:.1f}%")
+            safe_print()
+            safe_print(f"  [green]✓[/green] Prediction complete for [bold]{symbol}[/bold]")
+            safe_print(f"  [bold]CMP:[/bold] ₹{current:,.2f}  →  [bold]Target:[/bold] ₹{ensemble_pred:,.2f}  |  [{sig_color}]{overall_signal}[/{sig_color}]  |  Confidence: {ensemble_conf:.1f}%")
             _PREDICTION_CACHE[cache_key] = (result, now)
             return result
 

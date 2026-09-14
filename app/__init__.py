@@ -59,7 +59,9 @@ def create_app(config_name=None):
 
     # Register Blueprints
     from .routes.chart_routes import chart_bp
+    from .routes.watchlist_routes import watchlist_bp
     app.register_blueprint(chart_bp)
+    app.register_blueprint(watchlist_bp)
     app.register_blueprint(user_bp)
     app.register_blueprint(top_gain_loss)
     app.register_blueprint(top_news_bp)

@@ -41,65 +41,77 @@ _fallback_feeder_running = False
 _feeder_lock = threading.Lock()
 
 def _run_index_feeder():
-    """Background index broadcaster for clients in the 'indexes' room."""
+    """Background index broadcaster for clients in the 'indexes' and 'chart' rooms."""
     global _fallback_feeder_running
     import yfinance as yf
-    logger.info("Starting background index broadcaster...")
+    import eventlet
+    logger.info("Starting non-blocking background index broadcaster...")
+
+    # Symbols and their corresponding tokens
+    index_targets = [
+        ("^NSEI", "99926000", "NIFTY 50"),
+        ("^NSEBANK", "99926009", "BANK NIFTY"),
+        ("^BSESN", "99919000", "SENSEX"),
+        ("NIFTY_FIN_SERVICE.NS", "99926037", "FIN NIFTY"),
+    ]
+
     while _fallback_feeder_running:
         try:
-            nifty = yf.Ticker("^NSEI")
-            fast_nifty = nifty.fast_info
-            nifty_ltp = float(fast_nifty.get('lastPrice', 0) or 0)
-            nifty_prev = float(fast_nifty.get('previousClose', 0) or nifty_ltp)
-            nifty_open = float(fast_nifty.get('open', 0) or nifty_prev)
+            for ticker_sym, token_id, index_name in index_targets:
+                try:
+                    t = yf.Ticker(ticker_sym)
+                    fast = t.fast_info
+                    ltp = float(fast.get('lastPrice', 0) or 0)
+                    prev = float(fast.get('previousClose', 0) or ltp)
+                    open_p = float(fast.get('open', 0) or prev)
+                    day_h = float(fast.get('dayHigh', 0) or ltp)
+                    day_l = float(fast.get('dayLow', 0) or ltp)
 
-            if nifty_ltp > 0:
-                socketio.emit(
-                    "indexes_data",
-                    {
-                        "token": "99926000",
-                        "ltp": nifty_ltp,
-                        "full_data": {
-                            "last_traded_price": round(nifty_ltp * 100),
-                            "closed_price": round(nifty_prev * 100),
-                            "open_price_of_the_day": round(nifty_open * 100),
-                        }
-                    },
-                    room='indexes'
-                )
+                    if ltp > 0:
+                        socketio.emit(
+                            "indexes_data",
+                            {
+                                "token": token_id,
+                                "symbol": index_name,
+                                "ticker": ticker_sym,
+                                "ltp": round(ltp, 2),
+                                "full_data": {
+                                    "last_traded_price": round(ltp * 100),
+                                    "closed_price": round(prev * 100),
+                                    "open_price_of_the_day": round(open_p * 100),
+                                    "high_price": round(day_h * 100),
+                                    "low_price": round(day_l * 100),
+                                }
+                            },
+                            room='indexes'
+                        )
 
-            bank = yf.Ticker("^NSEBANK")
-            fast_bank = bank.fast_info
-            bank_ltp = float(fast_bank.get('lastPrice', 0) or 0)
-            bank_prev = float(fast_bank.get('previousClose', 0) or bank_ltp)
-            bank_open = float(fast_bank.get('open', 0) or bank_prev)
+                        # Feed into realtime candle manager
+                        realtime_candle_manager.process_tick(token_id, ltp, 1000)
+                        realtime_candle_manager.process_tick(index_name, ltp, 1000)
+                        realtime_candle_manager.process_tick(ticker_sym, ltp, 1000)
 
-            if bank_ltp > 0:
-                socketio.emit(
-                    "indexes_data",
-                    {
-                        "token": "99926009",
-                        "ltp": bank_ltp,
-                        "full_data": {
-                            "last_traded_price": round(bank_ltp * 100),
-                            "closed_price": round(bank_prev * 100),
-                            "open_price_of_the_day": round(bank_open * 100),
-                        }
-                    },
-                    room='indexes'
-                )
+                except Exception as tick_err:
+                    logger.debug(f"Tick error for {ticker_sym}: {tick_err}")
+
+                eventlet.sleep(0.1)
+
         except Exception as e:
             logger.error(f"Error in background index broadcaster: {e}")
 
-        time.sleep(3)
+        eventlet.sleep(2)
 
 def ensure_index_feeder():
     global _fallback_feeder_running
     with _feeder_lock:
         if not _fallback_feeder_running:
             _fallback_feeder_running = True
-            t = threading.Thread(target=_run_index_feeder, daemon=True)
-            t.start()
+            try:
+                import eventlet
+                eventlet.spawn(_run_index_feeder)
+            except Exception:
+                t = threading.Thread(target=_run_index_feeder, daemon=True)
+                t.start()
 
 
 @socketio.on('connect')
@@ -316,201 +328,77 @@ def get_user_smart_connect(user):
     return None
 
 @socketio.on("subscribe_chart")
-@validate_access_token
 def handle_chart_data(data):
     from flask_socketio import emit, join_room
     import yfinance as yf
 
     logger.info(f"Client {request.sid} subscribing to real-time chart: {data}")
+    ensure_index_feeder()
 
-    symbol = data.get('symbol', 'Nifty 50')
-    interval = data.get('interval', '1d')
+    symbol = data.get('symbol', 'Nifty 50') if isinstance(data, dict) else 'Nifty 50'
+    interval = data.get('interval', '1d') if isinstance(data, dict) else '1d'
 
     # 1. Resolve Symbol to Angel One token & exchange
     token_id, exchange = resolve_symbol_to_token(symbol)
     if not token_id:
-        logger.error(f"Symbol '{symbol}' could not be resolved to an Angel One token.")
-        emit('chart_data', {'error': f"Symbol '{symbol}' not found"}, to=request.sid)
-        return
-
-    # Map intervals to broker / standard names
-    INTERVAL_MAP = {
-        '1m':  'ONE_MINUTE',
-        '5m':  'FIVE_MINUTE',
-        '15m': 'FIFTEEN_MINUTE',
-        '30m': 'THIRTY_MINUTE',
-        '1h':  'ONE_HOUR',
-        '1d':  'ONE_DAY',
-    }
-
-    broker_interval = INTERVAL_MAP.get(interval, 'ONE_DAY')
+        token_id = symbol
 
     try:
-        # Cache lookup for historical backfill
-        cache_key = f"{token_id}_{interval}"
-        candles = backfill_cache.get(cache_key)
+        # 2. Join event-driven streaming Rooms
+        room_token = f"chart_{token_id}_{interval}"
+        room_symbol = f"chart_{symbol}_{interval}"
+        join_room(room_token)
+        join_room(room_symbol)
+        join_room('indexes')
+        logger.info(f"Joined client {request.sid} to chart rooms: {room_token}, {room_symbol}")
 
-        aggregator = realtime_candle_manager.get_aggregator(token_id, interval)
-
-        if not candles:
-            candles = []
-            # Calculate fromdate and todate for historical backfill (approx 300 periods)
-            to_dt = datetime.now()
-            if interval == '1d':
-                from_dt = to_dt - timedelta(days=365)
-            elif interval == '1h':
-                from_dt = to_dt - timedelta(days=60)
-            elif interval in ['15m', '30m']:
-                from_dt = to_dt - timedelta(days=15)
-            elif interval == '5m':
-                from_dt = to_dt - timedelta(days=5)
-            else:  # 1m
-                from_dt = to_dt - timedelta(days=2)
-
-            from_str = from_dt.strftime("%Y-%m-%d %H:%M")
-            to_str = to_dt.strftime("%Y-%m-%d %H:%M")
-
-            # Try to fetch historical data from broker API
-            smart_obj = get_user_smart_connect(request.user)
-            if smart_obj:
-                try:
-                    historic_params = {
-                        "exchange": exchange,
-                        "symboltoken": token_id,
-                        "interval": broker_interval,
-                        "fromdate": from_str,
-                        "todate": to_str
-                    }
-                    logger.info(f"Fetching historic candles from Angel One: {historic_params}")
-                    res = smart_obj.getCandleData(historic_params)
-                    if res and res.get("status") and res.get("data"):
-                        raw_data = res.get("data")
-                        for row in raw_data:
-                            if len(row) >= 6:
-                                try:
-                                    ts_str = row[0]
-                                    if 'T' in ts_str:
-                                        clean_ts = ts_str.split('+')[0].split('Z')[0]
-                                        dt = datetime.strptime(clean_ts, "%Y-%m-%dT%H:%M:%S")
-                                    else:
-                                        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
-                                    ts_ms = int(dt.timestamp() * 1000)
-                                except Exception as parse_err:
-                                    logger.error(f"Error parsing candle date '{ts_str}': {parse_err}")
-                                    continue
-
-                                candles.append({
-                                    'time': ts_ms,
-                                    'open': float(row[1]),
-                                    'high': float(row[2]),
-                                    'low': float(row[3]),
-                                    'close': float(row[4]),
-                                    'volume': int(row[5])
-                                })
-                except Exception as broker_err:
-                    logger.error(f"Failed to fetch historical candles from Angel One: {broker_err}")
-
-            # Graceful yfinance fallback if Angel One returns no candles (e.g. BSE or index offline)
-            if not candles:
-                logger.info(f"Falling back to yfinance for history: symbol={symbol}")
-                try:
-                    yf_symbol_map = {
-                        'Nifty 50': '^NSEI',
-                        'Nifty Bank': '^NSEBANK',
-                        'Bank Nifty': '^NSEBANK',
-                        'Finnifty': '^CNXFIN',
-                        'Midcpnifty': '^CRSLMID',
-                        'Sensex': '^BSESN',
-                        'Nifty IT': '^CNXIT',
-                        'Nifty Auto': '^CNXAUTO'
-                    }
-                    yf_ticker = yf_symbol_map.get(symbol, symbol)
-                    ticker = yf.Ticker(yf_ticker)
-                    
-                    yf_period = '1mo'
-                    if interval == '1d':
-                        yf_period = '6mo'
-                    elif interval == '1m':
-                        yf_period = '5d'
-
-                    df = ticker.history(period=yf_period, interval=interval)
-                    if not df.empty:
-                        for idx, row in df.iterrows():
-                            candles.append({
-                                'time': int(idx.timestamp() * 1000),
-                                'open': round(float(row['Open']), 2),
-                                'high': round(float(row['High']), 2),
-                                'low': round(float(row['Low']), 2),
-                                'close': round(float(row['Close']), 2),
-                                'volume': int(row['Volume']),
-                            })
-                except Exception as yf_err:
-                    logger.error(f"yfinance fallback failed: {yf_err}")
-
-            if candles:
-                # Prime/seed aggregator in memory
-                aggregator.prime_history(candles)
-                backfill_cache.set(cache_key, candles)
-
-        # 2. Get up-to-date candle list from aggregator (merges history + real-time ticks)
-        full_candles = aggregator.get_candles()
-        if not full_candles:
-            emit('chart_data', {'error': 'No historical or real-time data available'}, to=request.sid)
-            return
-
-        current_price = full_candles[-1]['close']
-        prev_close = full_candles[-2]['close'] if len(full_candles) > 1 else full_candles[-1]['open']
-
-        # Send historical backfill
-        emit('chart_data', {
-            'type': 'history',
-            'symbol': symbol,
-            'token': token_id,
-            'candles': full_candles,
-            'currentPrice': round(float(current_price), 2),
-            'previousClose': round(float(prev_close), 2)
-        }, to=request.sid)
-
-        # 3. Join event-driven streaming Room
-        room_name = f"chart_{token_id}_{interval}"
-        join_room(room_name)
-        logger.info(f"Joined client {request.sid} to chart room: {room_name}")
-
-        # Keep track of room to cleanup on unsubscribe
         request_key = f"{request.sid}_chart"
-        chart_connections[request_key] = room_name
+        chart_connections[request_key] = room_token
 
-        # 4. Subscribe the central broker WebSocket to live ticks for this token
-        client_code = request.user['angleClientCode']
-        if client_code not in active_smartapi_sockets:
-            smartapi_connect = SmartAPISocket.on_connect(
-                client_code,
-                request.user["angleClientPin"],
-                request.user["angleTotpSecret"],
-                request.user["angleApiKey"]
-            )
-            jwt_token = smartapi_connect["data"]["jwtToken"]
-            if jwt_token.startswith("Bearer "):
-                jwt_token = jwt_token.split(" ")[1]
-            feed_token = smartapi_connect["data"]["feedToken"]
+        # 3. Optional: If user has SmartAPI credentials, subscribe to broker feed
+        user = getattr(request, 'user', None) or {}
+        client_code = user.get('angleClientCode')
+        if client_code:
+            try:
+                if client_code not in active_smartapi_sockets:
+                    smartapi_connect = SmartAPISocket.on_connect(
+                        client_code,
+                        user.get("angleClientPin"),
+                        user.get("angleTotpSecret"),
+                        user.get("angleApiKey")
+                    )
+                    if isinstance(smartapi_connect, dict) and smartapi_connect.get("data"):
+                        jwt_token = smartapi_connect["data"].get("jwtToken", "")
+                        if jwt_token.startswith("Bearer "):
+                            jwt_token = jwt_token.split(" ")[1]
+                        feed_token = smartapi_connect["data"].get("feedToken", "")
 
-            a1_socket = AngelOneWebSocket(
-                jwt_token=jwt_token,
-                api_key=request.user["angleApiKey"],
-                client_code=client_code,
-                feed_token=feed_token,
-                tokens=[symbol],
-                room=request.sid
-            )
-            active_smartapi_sockets[client_code] = a1_socket
-            a1_socket.connect()
-        else:
-            a1_socket = active_smartapi_sockets[client_code]
+                        a1_socket = AngelOneWebSocket(
+                            jwt_token=jwt_token,
+                            api_key=user.get("angleApiKey"),
+                            client_code=client_code,
+                            feed_token=feed_token,
+                            tokens=[symbol],
+                            room=request.sid
+                        )
+                        active_smartapi_sockets[client_code] = a1_socket
+                        a1_socket.connect()
+                else:
+                    a1_socket = active_smartapi_sockets[client_code]
 
-        # Dynamically add the symbol/token to the live feed if not present
-        if symbol not in a1_socket.tokens:
-            a1_socket.tokens.append(symbol)
-            a1_socket.subscribe_tokens([symbol])
+                if client_code in active_smartapi_sockets:
+                    a1_socket = active_smartapi_sockets[client_code]
+                    if symbol not in a1_socket.tokens:
+                        a1_socket.tokens.append(symbol)
+                        a1_socket.subscribe_tokens([symbol])
+            except Exception as broker_err:
+                logger.warning(f"Broker connection optional fallback: {broker_err}")
+
+        emit('chart_status', {'status': 'subscribed', 'symbol': symbol, 'interval': interval}, to=request.sid)
+
+    except Exception as e:
+        logger.error(f"Error handling chart subscription: {e}")
+        emit('chart_data', {'error': str(e)}, to=request.sid)
 
     except Exception as e:
         logger.error(f"Error handling chart subscription: {e}")
