@@ -6,7 +6,12 @@ from . import extensions
 from .socket import socketio
 import os
 from flask_socketio import SocketIO, emit
-from nse import NSE
+try:
+    from nse import NSE
+    _NSE_AVAILABLE = True
+except ImportError:
+    NSE = None
+    _NSE_AVAILABLE = False
 
 
 from .routes.user_routes import user_bp
@@ -27,9 +32,12 @@ try:
 except OSError:
     pass
 
-try:
-    nse = NSE(download_folder=_NSE_DOWNLOAD_DIR)
-except Exception as _e:
+if _NSE_AVAILABLE:
+    try:
+        nse = NSE(download_folder=_NSE_DOWNLOAD_DIR)
+    except Exception as _e:
+        nse = None
+else:
     nse = None
 
 logger = get_logger(__name__)
