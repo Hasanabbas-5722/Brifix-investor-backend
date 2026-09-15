@@ -230,6 +230,15 @@ def get_chart_data():
             last_candle['high'] = max(last_candle['high'], fast_quote['currentPrice'])
             last_candle['low'] = min(last_candle['low'], fast_quote['currentPrice'])
 
+        # Prime the real-time candle manager with these historical candles
+        try:
+            from app.services.realtime_candle_manager import realtime_candle_manager
+            realtime_candle_manager.get_aggregator(raw_symbol, interval).prime_history(candles)
+            if ticker_sym != raw_symbol:
+                realtime_candle_manager.get_aggregator(ticker_sym, interval).prime_history(candles)
+        except Exception as seed_err:
+            logger.debug(f"Could not prime candle manager: {seed_err}")
+
         response_data = {
             'success': True,
             'data': {

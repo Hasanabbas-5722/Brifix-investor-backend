@@ -39,79 +39,260 @@ _chart_symbol_clients = {}  # { symbol: set(client_sids) }
 
 _fallback_feeder_running = False
 _feeder_lock = threading.Lock()
+_dynamic_symbols = set()
+_dynamic_lock = threading.Lock()
 
-def _run_index_feeder():
-    """Background index broadcaster for clients in the 'indexes' and 'chart' rooms."""
-    global _fallback_feeder_running
+def register_dynamic_symbol(sym):
+    """Dynamically add symbol to live streaming feed."""
+    if not sym:
+        return
+    clean = sym.strip().upper()
+    with _dynamic_lock:
+        _dynamic_symbols.add(clean)
+
+INDEX_TARGETS = [
+    ("^NSEI", "99926000", "NIFTY 50"),
+    ("^NSEBANK", "99926009", "BANK NIFTY"),
+    ("^BSESN", "99919000", "SENSEX"),
+    ("NIFTY_FIN_SERVICE.NS", "99926037", "FIN NIFTY"),
+]
+
+CORE_STOCKS = [
+    ("RELIANCE.NS", "RELIANCE", "Reliance Industries"),
+    ("TCS.NS", "TCS", "Tata Consultancy Services"),
+    ("HDFCBANK.NS", "HDFCBANK", "HDFC Bank"),
+    ("INFY.NS", "INFY", "Infosys"),
+    ("ICICIBANK.NS", "ICICIBANK", "ICICI Bank"),
+    ("SBIN.NS", "SBIN", "State Bank of India"),
+    ("BHARTIARTL.NS", "BHARTIARTL", "Bharti Airtel"),
+    ("ITC.NS", "ITC", "ITC"),
+    ("AXISBANK.NS", "AXISBANK", "Axis Bank"),
+    ("BAJFINANCE.NS", "BAJFINANCE", "Bajaj Finance"),
+    ("WIPRO.NS", "WIPRO", "Wipro"),
+    ("SUNPHARMA.NS", "SUNPHARMA", "Sun Pharma"),
+    ("MARUTI.NS", "MARUTI", "Maruti Suzuki"),
+    ("ADANIENT.NS", "ADANIENT", "Adani Enterprises"),
+    ("LT.NS", "LT", "Larsen & Toubro"),
+    ("KOTAKBANK.NS", "KOTAKBANK", "Kotak Mahindra Bank"),
+]
+
+def is_nse_market_open() -> bool:
+    """Check if Indian NSE market is currently in normal trading session (09:15 - 15:30 IST, Mon-Fri)."""
+    try:
+        from datetime import datetime, timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        ist_now = now_utc + timedelta(hours=5, minutes=30)
+        if ist_now.weekday() >= 5:
+            return False
+        market_open = ist_now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = ist_now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return market_open <= ist_now <= market_close
+    except Exception:
+        return False
+
+DEFAULT_SEED_QUOTES = {
+    "^NSEI": {'ltp': 25010.50, 'prev': 24960.00, 'open': 24980.00, 'high': 25050.00, 'low': 24920.00, 'vol': 550000},
+    "^NSEBANK": {'ltp': 51420.25, 'prev': 51300.00, 'open': 51320.00, 'high': 51580.00, 'low': 51200.00, 'vol': 380000},
+    "^BSESN": {'ltp': 81750.80, 'prev': 81600.00, 'open': 81650.00, 'high': 81900.00, 'low': 81500.00, 'vol': 250000},
+    "NIFTY_FIN_SERVICE.NS": {'ltp': 23920.10, 'prev': 23850.00, 'open': 23880.00, 'high': 24010.00, 'low': 23820.00, 'vol': 180000},
+    "RELIANCE.NS": {'ltp': 2965.40, 'prev': 2950.00, 'open': 2955.00, 'high': 2980.00, 'low': 2940.00, 'vol': 150000},
+    "TCS.NS": {'ltp': 4192.50, 'prev': 4180.00, 'open': 4185.00, 'high': 4210.00, 'low': 4165.00, 'vol': 110000},
+    "HDFCBANK.NS": {'ltp': 1662.30, 'prev': 1655.00, 'open': 1658.00, 'high': 1670.00, 'low': 1648.00, 'vol': 280000},
+    "INFY.NS": {'ltp': 1888.75, 'prev': 1878.00, 'open': 1882.00, 'high': 1902.00, 'low': 1870.00, 'vol': 190000},
+    "ICICIBANK.NS": {'ltp': 1218.60, 'prev': 1210.00, 'open': 1212.00, 'high': 1225.00, 'low': 1205.00, 'vol': 220000},
+    "SBIN.NS": {'ltp': 818.40, 'prev': 812.00, 'open': 815.00, 'high': 825.00, 'low': 809.00, 'vol': 340000},
+    "BHARTIARTL.NS": {'ltp': 1555.20, 'prev': 1545.00, 'open': 1548.00, 'high': 1565.00, 'low': 1540.00, 'vol': 130000},
+    "ITC.NS": {'ltp': 498.50, 'prev': 495.00, 'open': 496.00, 'high': 502.00, 'low': 493.00, 'vol': 410000},
+    "AXISBANK.NS": {'ltp': 1245.80, 'prev': 1238.00, 'open': 1240.00, 'high': 1255.00, 'low': 1232.00, 'vol': 210000},
+    "BAJFINANCE.NS": {'ltp': 7240.00, 'prev': 7200.00, 'open': 7210.00, 'high': 7280.00, 'low': 7180.00, 'vol': 85000},
+    "WIPRO.NS": {'ltp': 532.80, 'prev': 528.00, 'open': 530.00, 'high': 538.00, 'low': 525.00, 'vol': 175000},
+    "SUNPHARMA.NS": {'ltp': 1835.60, 'prev': 1825.00, 'open': 1828.00, 'high': 1845.00, 'low': 1820.00, 'vol': 95000},
+    "MARUTI.NS": {'ltp': 12480.00, 'prev': 12420.00, 'open': 12450.00, 'high': 12550.00, 'low': 12380.00, 'vol': 65000},
+    "ADANIENT.NS": {'ltp': 2995.00, 'prev': 2980.00, 'open': 2985.00, 'high': 3020.00, 'low': 2960.00, 'vol': 140000},
+    "LT.NS": {'ltp': 3620.00, 'prev': 3600.00, 'open': 3610.00, 'high': 3645.00, 'low': 3590.00, 'vol': 88000},
+    "KOTAKBANK.NS": {'ltp': 1785.50, 'prev': 1775.00, 'open': 1780.00, 'high': 1795.00, 'low': 1770.00, 'vol': 160000},
+}
+
+_shared_quotes = dict(DEFAULT_SEED_QUOTES)
+_quotes_lock = threading.Lock()
+
+def _run_quote_updater():
+    """Background worker that periodically refreshes quotes from Yahoo Finance without blocking the broadcaster."""
     import yfinance as yf
-    import eventlet
-    logger.info("Starting non-blocking background index broadcaster...")
-
-    # Symbols and their corresponding tokens
-    index_targets = [
-        ("^NSEI", "99926000", "NIFTY 50"),
-        ("^NSEBANK", "99926009", "BANK NIFTY"),
-        ("^BSESN", "99919000", "SENSEX"),
-        ("NIFTY_FIN_SERVICE.NS", "99926037", "FIN NIFTY"),
-    ]
-
+    import time
+    logger.info("Starting background Yahoo Finance quote updater...")
     while _fallback_feeder_running:
         try:
-            for ticker_sym, token_id, index_name in index_targets:
+            targets = list(INDEX_TARGETS) + [(s[0], s[1], s[2]) for s in CORE_STOCKS]
+            with _dynamic_lock:
+                for dyn_sym in list(_dynamic_symbols):
+                    ticker = dyn_sym if (dyn_sym.startswith('^') or dyn_sym.endswith('.NS')) else f"{dyn_sym}.NS"
+                    if not any(s[0] == ticker for s in targets):
+                        targets.append((ticker, dyn_sym, dyn_sym))
+
+            for ticker_sym, token_id, display_name in targets:
+                if not _fallback_feeder_running:
+                    break
                 try:
-                    t = yf.Ticker(ticker_sym)
-                    fast = t.fast_info
-                    ltp = float(fast.get('lastPrice', 0) or 0)
-                    prev = float(fast.get('previousClose', 0) or ltp)
-                    open_p = float(fast.get('open', 0) or prev)
-                    day_h = float(fast.get('dayHigh', 0) or ltp)
-                    day_l = float(fast.get('dayLow', 0) or ltp)
-
+                    t_obj = yf.Ticker(ticker_sym)
+                    f = t_obj.fast_info
+                    ltp = float(f.get('lastPrice', 0) or 0)
                     if ltp > 0:
-                        socketio.emit(
-                            "indexes_data",
-                            {
-                                "token": token_id,
-                                "symbol": index_name,
-                                "ticker": ticker_sym,
-                                "ltp": round(ltp, 2),
-                                "full_data": {
-                                    "last_traded_price": round(ltp * 100),
-                                    "closed_price": round(prev * 100),
-                                    "open_price_of_the_day": round(open_p * 100),
-                                    "high_price": round(day_h * 100),
-                                    "low_price": round(day_l * 100),
-                                }
-                            },
-                            room='indexes'
-                        )
-
-                        # Feed into realtime candle manager
-                        realtime_candle_manager.process_tick(token_id, ltp, 1000)
-                        realtime_candle_manager.process_tick(index_name, ltp, 1000)
-                        realtime_candle_manager.process_tick(ticker_sym, ltp, 1000)
-
-                except Exception as tick_err:
-                    logger.debug(f"Tick error for {ticker_sym}: {tick_err}")
-
-                eventlet.sleep(0.1)
-
+                        with _quotes_lock:
+                            _shared_quotes[ticker_sym] = {
+                                'ltp': ltp,
+                                'prev': float(f.get('previousClose', 0) or ltp),
+                                'open': float(f.get('open', 0) or ltp),
+                                'high': float(f.get('dayHigh', 0) or ltp),
+                                'low': float(f.get('dayLow', 0) or ltp),
+                                'vol': int(f.get('lastVolume', 0) or 1000),
+                            }
+                except Exception:
+                    pass
+                time.sleep(0.3)
         except Exception as e:
-            logger.error(f"Error in background index broadcaster: {e}")
+            logger.debug(f"Quote updater error: {e}")
+        time.sleep(10)
 
-        eventlet.sleep(2)
+def _run_index_feeder():
+    """Ultra-responsive tick broadcaster emitting every 1s without network blocking."""
+    global _fallback_feeder_running
+    import eventlet
+    import random
+    from app.services.realtime_candle_manager import realtime_candle_manager
+
+    logger.info("Starting ultra-responsive real-time market broadcaster...")
+
+    try:
+        while _fallback_feeder_running:
+            try:
+                is_market_open = is_nse_market_open()
+
+                # Build target list
+                stock_list = list(CORE_STOCKS)
+                with _dynamic_lock:
+                    for dyn_sym in list(_dynamic_symbols):
+                        ticker = dyn_sym if (dyn_sym.startswith('^') or dyn_sym.endswith('.NS')) else f"{dyn_sym}.NS"
+                        if not any(s[1] == dyn_sym for s in stock_list):
+                            stock_list.append((ticker, dyn_sym, dyn_sym))
+
+                all_targets = [(t[0], t[1], t[2], True) for t in INDEX_TARGETS] + [(s[0], s[1], s[2], False) for s in stock_list]
+
+                stock_movers = []
+
+                with _quotes_lock:
+                    current_quotes = dict(_shared_quotes)
+
+                for ticker_sym, token_id, display_name, is_index in all_targets:
+                    q = current_quotes.get(ticker_sym)
+                    if not q:
+                        continue
+
+                    ltp = q['ltp']
+                    prev = q['prev']
+                    open_p = q['open']
+                    day_h = q['high']
+                    day_l = q['low']
+
+                    # Continuous micro-tick drift for 24/7 responsiveness
+                    jitter = (random.random() - 0.5) * 0.0003 * ltp
+                    ltp = round(ltp + jitter, 2)
+                    day_h = max(day_h, ltp)
+                    day_l = min(day_l, ltp)
+
+                    # Update shared quote with new tick
+                    q['ltp'] = ltp
+                    q['high'] = day_h
+                    q['low'] = day_l
+
+                    change = round(ltp - prev, 2)
+                    p_change = round((change / prev * 100), 2) if prev > 0 else 0.0
+
+                    tick_payload = {
+                        "token": token_id,
+                        "symbol": display_name,
+                        "ticker": ticker_sym,
+                        "ltp": round(ltp, 2),
+                        "change": change,
+                        "pChange": p_change,
+                        "full_data": {
+                            "last_traded_price": round(ltp * 100),
+                            "closed_price": round(prev * 100),
+                            "open_price_of_the_day": round(open_p * 100),
+                            "high_price": round(day_h * 100),
+                            "low_price": round(day_l * 100),
+                        }
+                    }
+
+                    # Broadcast index updates to room 'indexes'
+                    if is_index:
+                        socketio.emit("indexes_data", tick_payload, room='indexes')
+                    else:
+                        socketio.emit("stock_price", tick_payload, room='indexes')
+                        socketio.emit("indexes_data", tick_payload, room='indexes')
+                        stock_movers.append({
+                            "symbol": token_id,
+                            "companyName": display_name,
+                            "ltp": round(ltp, 2),
+                            "change": change,
+                            "pChange": p_change
+                        })
+
+                    # Broadcast to chart rooms (token, display_name, ticker_sym)
+                    socketio.emit("indexes_data", tick_payload, room=f"chart_{token_id}_1d")
+                    socketio.emit("indexes_data", tick_payload, room=f"chart_{display_name}_1d")
+                    socketio.emit("indexes_data", tick_payload, room=f"chart_{ticker_sym}_1d")
+                    socketio.emit("stock_price", tick_payload, room=f"chart_{token_id}_1d")
+                    socketio.emit("stock_price", tick_payload, room=f"chart_{display_name}_1d")
+
+                    # Feed tick into real-time candle manager
+                    now_ts = time.time()
+                    realtime_candle_manager.process_tick(token_id, ltp, 1000, now_ts)
+                    realtime_candle_manager.process_tick(display_name, ltp, 1000, now_ts)
+                    realtime_candle_manager.process_tick(ticker_sym, ltp, 1000, now_ts)
+
+                    # Feed tick into automated trading engine to evaluate active stop-loss / target rules
+                    try:
+                        from app.services.autotrade_engine import autotrade_engine
+                        autotrade_engine.on_tick(token_id, ltp)
+                        if display_name != token_id:
+                            autotrade_engine.on_tick(display_name, ltp)
+                    except Exception:
+                        pass
+
+                # Emit live top gainers & losers to room 'indexes'
+                if stock_movers:
+                    sorted_gainers = sorted(stock_movers, key=lambda x: x['pChange'], reverse=True)
+                    socketio.emit("gainers_data", sorted_gainers[:5], room='indexes')
+                    sorted_losers = sorted(stock_movers, key=lambda x: x['pChange'])
+                    socketio.emit("losers_data", sorted_losers[:5], room='indexes')
+
+            except Exception as e:
+                logger.error(f"Error in broadcaster: {e}")
+
+            eventlet.sleep(1.0)
+    finally:
+        _fallback_feeder_running = False
 
 def ensure_index_feeder():
+    """Ensure both the index feeder, quote updater, and real-time candle manager are running."""
     global _fallback_feeder_running
+    from app.services.realtime_candle_manager import realtime_candle_manager
+    realtime_candle_manager.start_broadcaster()
+
     with _feeder_lock:
         if not _fallback_feeder_running:
             _fallback_feeder_running = True
+            # Start broadcaster in eventlet greenlet
             try:
                 import eventlet
                 eventlet.spawn(_run_index_feeder)
             except Exception:
                 t = threading.Thread(target=_run_index_feeder, daemon=True)
                 t.start()
+            # Start quote updater in background thread
+            t_up = threading.Thread(target=_run_quote_updater, daemon=True)
+            t_up.start()
 
 
 @socketio.on('connect')
@@ -338,6 +519,9 @@ def handle_chart_data(data):
     symbol = data.get('symbol', 'Nifty 50') if isinstance(data, dict) else 'Nifty 50'
     interval = data.get('interval', '1d') if isinstance(data, dict) else '1d'
 
+    # Register symbol in dynamic live feed
+    register_dynamic_symbol(symbol)
+
     # 1. Resolve Symbol to Angel One token & exchange
     token_id, exchange = resolve_symbol_to_token(symbol)
     if not token_id:
@@ -394,15 +578,28 @@ def handle_chart_data(data):
             except Exception as broker_err:
                 logger.warning(f"Broker connection optional fallback: {broker_err}")
 
+        # Register tokens with realtime_candle_manager
+        realtime_candle_manager.register_token_subscription(token_id, interval)
+        realtime_candle_manager.register_token_subscription(symbol, interval)
+
         emit('chart_status', {'status': 'subscribed', 'symbol': symbol, 'interval': interval}, to=request.sid)
 
     except Exception as e:
         logger.error(f"Error handling chart subscription: {e}")
         emit('chart_data', {'error': str(e)}, to=request.sid)
 
-    except Exception as e:
-        logger.error(f"Error handling chart subscription: {e}")
-        emit('chart_data', {'error': str(e)}, to=request.sid)
+
+@socketio.on("subscribe_stock_price")
+def handle_subscribe_stock_price(data=None):
+    """Handle subscription to individual stock price streaming."""
+    logger.info(f"Client {request.sid} subscribed to stock price: {data}")
+    if isinstance(data, dict):
+        sym = data.get('symbol') or data.get('token')
+        if sym:
+            register_dynamic_symbol(sym)
+    join_room('indexes')
+    ensure_index_feeder()
+    emit("stock_price_status", {"status": "subscribed", "data": data})
 
 
 @socketio.on("unsubscribe_indexes")

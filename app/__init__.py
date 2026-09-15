@@ -81,6 +81,10 @@ def create_app(config_name=None):
     # Register Blueprints
     from .routes.chart_routes import chart_bp
     from .routes.watchlist_routes import watchlist_bp
+    from .routes.broker_routes import broker_bp
+    from .routes.autotrade_routes import autotrade_bp
+    from .services.autotrade_engine import autotrade_engine
+
     app.register_blueprint(chart_bp)
     app.register_blueprint(watchlist_bp)
     app.register_blueprint(user_bp)
@@ -88,5 +92,10 @@ def create_app(config_name=None):
     app.register_blueprint(top_news_bp)
     app.register_blueprint(predict_bp)
     app.register_blueprint(groww)
+    app.register_blueprint(broker_bp)
+    app.register_blueprint(autotrade_bp)
+
+    # Start automated trading background engine
+    autotrade_engine.start()
 
     return app

@@ -33,15 +33,15 @@ class CandleAggregator:
 
     def process_tick(self, price, volume, timestamp):
         """Update the active candle or start a new candle based on the tick timestamp."""
-        # Align timestamp to candle start time boundary
-        candle_start = int(timestamp - (timestamp % self.interval_sec))
-        candle_time_ms = candle_start * 1000
+        ts_sec = int(timestamp / 1000) if timestamp > 1e11 else int(timestamp)
+        # Exchange offset (IST = +19800) to align with lightweight-charts candles
+        candle_start = int(ts_sec - (ts_sec % self.interval_sec)) + 19800
 
         with self.lock:
             if not self.candles:
                 # No history yet, create the first candle
                 new_candle = {
-                    "time": candle_time_ms,
+                    "time": candle_start,
                     "open": price,
                     "high": price,
                     "low": price,
@@ -54,22 +54,26 @@ class CandleAggregator:
 
             last_candle = self.candles[-1]
 
-            if candle_time_ms == last_candle["time"]:
+            is_same_candle = (candle_start == last_candle["time"]) or (
+                self.interval == '1d' and abs(candle_start - last_candle["time"]) < 86400
+            )
+
+            if is_same_candle:
                 # Tick belongs to the current active candle
                 last_candle["high"] = round(max(last_candle["high"], price), 2)
                 last_candle["low"] = round(min(last_candle["low"], price), 2)
                 last_candle["close"] = round(price, 2)
-                last_candle["volume"] += volume
+                last_candle["volume"] = int(last_candle.get("volume", 0) or 0) + int(volume or 0)
                 self.dirty = True
-            elif candle_time_ms > last_candle["time"]:
+            elif candle_start > last_candle["time"]:
                 # New candle interval has started
                 new_candle = {
-                    "time": candle_time_ms,
+                    "time": candle_start,
                     "open": round(price, 2),
                     "high": round(price, 2),
                     "low": round(price, 2),
                     "close": round(price, 2),
-                    "volume": volume
+                    "volume": int(volume or 0)
                 }
                 self.candles.append(new_candle)
                 
@@ -77,6 +81,12 @@ class CandleAggregator:
                 if len(self.candles) > 500:
                     self.candles.pop(0)
 
+                self.dirty = True
+            else:
+                # Historical timestamp slightly ahead, still update active candle close and bounds
+                last_candle["high"] = round(max(last_candle["high"], price), 2)
+                last_candle["low"] = round(min(last_candle["low"], price), 2)
+                last_candle["close"] = round(price, 2)
                 self.dirty = True
 
     def get_candles(self):
@@ -120,10 +130,15 @@ class RealtimeCandleManager:
         self.socketio = socketio
         self.start_broadcaster()
 
-    def register_token_subscription(self, token):
-        """Mark a token as active when a client subscribes."""
+    def register_token_subscription(self, token, interval='1d'):
+        """Mark a token as active when a client subscribes and initialize its aggregator."""
+        if not token:
+            return
         with self.lock:
             self.active_tokens.add(token)
+            agg_key = (token, interval)
+            if agg_key not in self.aggregators:
+                self.aggregators[agg_key] = CandleAggregator(token, interval)
 
     def process_tick(self, token, price, volume, timestamp=None):
         """Process an incoming tick and feed it to all aggregators for this token."""
@@ -132,12 +147,17 @@ class RealtimeCandleManager:
         if timestamp is None:
             timestamp = time.time()
 
-        # Update aggregators for all timeframes of this token
-        for interval in INTERVAL_SECONDS.keys():
-            agg_key = (token, interval)
-            agg = self.aggregators.get(agg_key)
-            if agg:
-                agg.process_tick(price, volume, timestamp)
+        # Update aggregators for all active timeframes of this token
+        with self.lock:
+            for interval in list(INTERVAL_SECONDS.keys()):
+                agg_key = (token, interval)
+                agg = self.aggregators.get(agg_key)
+                if agg:
+                    agg.process_tick(price, volume, timestamp)
+                elif token in self.active_tokens and interval == '1d':
+                    agg = CandleAggregator(token, interval)
+                    self.aggregators[agg_key] = agg
+                    agg.process_tick(price, volume, timestamp)
 
     def get_aggregator(self, token, interval):
         """Get or create the CandleAggregator for a token and interval."""
@@ -152,13 +172,26 @@ class RealtimeCandleManager:
     def start_broadcaster(self):
         """Start the background task to periodically broadcast updated candles to rooms."""
         with self.lock:
-            if self.broadcaster_running or not self.socketio or not getattr(self.socketio, 'server', None):
+            if self.broadcaster_running or not self.socketio:
                 return
             self.broadcaster_running = True
             
-            # Start background broadcaster using eventlet/gevent via socketio
-            self.socketio.start_background_task(self._broadcast_loop)
-            logger.info("Started real-time candle broadcast background thread.")
+            try:
+                if getattr(self.socketio, 'server', None):
+                    self.socketio.start_background_task(self._broadcast_loop)
+                    logger.info("Started real-time candle broadcast background task.")
+                    return
+            except Exception as e:
+                logger.warning(f"Could not start via start_background_task: {e}")
+
+            try:
+                import eventlet
+                eventlet.spawn(self._broadcast_loop)
+                logger.info("Started real-time candle broadcast via eventlet.spawn.")
+            except Exception:
+                t = threading.Thread(target=self._broadcast_loop, daemon=True)
+                t.start()
+                logger.info("Started real-time candle broadcast via threading.Thread.")
 
     def _broadcast_loop(self):
         """Periodic broadcast loop checking for dirty candles and pushing updates (throttled)."""
