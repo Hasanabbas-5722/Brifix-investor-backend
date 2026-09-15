@@ -1,14 +1,19 @@
 import os
 import sys
 
-# Eventlet monkey patch (safe wrapper for local/server environments)
-try:
-    if sys.platform == "darwin":
-        os.environ.setdefault("EVENTLET_HUB", "selects")
-    import eventlet
-    eventlet.monkey_patch()
-except Exception:
-    pass
+# DO NOT monkey-patch eventlet in serverless environments (Vercel / AWS Lambda).
+# Monkey-patching eventlet replaces standard sockets with greenlets, which deadlocks
+# database drivers (PyMongo) and crashes Vercel's internal async runtime with:
+# "RuntimeError: asyncio.run() cannot be called from a running event loop"
+IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+if not IS_SERVERLESS:
+    try:
+        if sys.platform == "darwin":
+            os.environ.setdefault("EVENTLET_HUB", "selects")
+        import eventlet
+        eventlet.monkey_patch()
+    except Exception:
+        pass
 
 from app import create_app
 from flask_cors import CORS

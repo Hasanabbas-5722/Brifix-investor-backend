@@ -1,3 +1,4 @@
+import os
 import requests
 from pathlib import Path
 from flask_socketio import SocketIO, emit
@@ -10,12 +11,12 @@ logger = get_logger(__name__)
 
 logger.info("Initializing SocketIO...")
 
-# Initialize SocketIO with eventlet (since eventlet is installed)
+is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+# Initialize SocketIO with threading on serverless, eventlet for dedicated server
 socketio = SocketIO(
     cors_allowed_origins="*",
-    async_mode='eventlet',  # Use eventlet since it's installed
-    # logger=True,
-    # engineio_logger=True
+    async_mode='threading' if is_serverless else 'eventlet',
 )
 
 from app.services.realtime_candle_manager import realtime_candle_manager

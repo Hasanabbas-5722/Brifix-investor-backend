@@ -12,6 +12,12 @@ COLLECTION_NAME = "users"
 
 db = connect_to_mongodb()
 
+def _get_db():
+    global db
+    if db is None:
+        db = connect_to_mongodb()
+    return db
+
 class User:
     """User model for MongoDB"""
     
@@ -40,7 +46,11 @@ class User:
     def find_by_email(email):
         """Find user by email"""
         logger.info(f"email : {email}")
-        user_data = db.users.find_one({"email": email})
+        database = _get_db()
+        if database is None:
+            logger.error("Database connection is None in find_by_email")
+            return None
+        user_data = database.users.find_one({"email": email})
         logger.info(f"user data :::: {user_data}")
         if not user_data:
             return None
@@ -61,7 +71,7 @@ class User:
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
-            result = db.users.insert_one(doc)
+            result = _get_db().users.insert_one(doc)
             doc["_id"] = result.inserted_id
             doc["id"] = str(result.inserted_id)
             return doc
@@ -73,7 +83,7 @@ class User:
     def update_token(id, jwt_token):
         """Update user accessToken only"""
         try:
-            result = db.users.update_one(
+            result = _get_db().users.update_one(
                 {"_id": ObjectId(id)},
                 {"$set": {
                     "accessToken": jwt_token,
@@ -89,7 +99,7 @@ class User:
     def update(angle_jwt_token, angle_refresh_token, angle_feed_token, id, jwt_token):
         """Update user"""
         try:
-            result = db.users.update_one(
+            result = _get_db().users.update_one(
                 {"_id": ObjectId(id)},
                 {"$set": {
                     "angleJwtToken": angle_jwt_token,
@@ -109,7 +119,7 @@ class User:
         """Find user by id"""
         try:
             logger.info(f"id : {id}")
-            user_data = db.users.find_one({"_id": ObjectId(id)})
+            user_data = _get_db().users.find_one({"_id": ObjectId(id)})
             if not user_data:
                 return None
             user_data["_id"] = str(user_data["_id"])
@@ -123,7 +133,7 @@ class User:
     def update_password(email, new_password):
         """Update user password"""
         try:
-            result = db.users.update_one(
+            result = _get_db().users.update_one(
                 {"email": email},
                 {"$set": {
                     "password": new_password,
