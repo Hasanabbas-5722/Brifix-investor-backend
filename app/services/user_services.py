@@ -14,9 +14,6 @@ def create_access_token(user):
     user_payload = {
         "user_id": str(user["_id"]),
         "email": user.get("email", ""),
-        "username": user.get("username", ""),
-        "name": user.get("name", ""),
-        "plan": user.get("currentPlan", user.get("plan", "Free")),
         "isAdmin": user.get("isAdmin", False),
         "exp": now + timedelta(days=7),  # 7-day token for good user experience
         "iat": now,
@@ -31,37 +28,17 @@ class UserService:
         pass
 
     @staticmethod
-    def register(name, email, password, phone=None, username=None, current_plan="Free", trading_experience="Beginner", **kwargs):
+    def register(name, email, password, phone=None):
         try:
             if not email or not password:
                 return {"data": {"message": "Email and password are required"}}, 400
 
-            clean_email = email.strip().lower()
-            clean_username = (username or clean_email.split("@")[0]).strip().lower()
-
-            if len(password) < 6:
-                return {"data": {"message": "Password must be at least 6 characters long"}}, 400
-
-            existing_email = User.find_by_email(clean_email)
-            if existing_email:
-                return {"data": {"message": "An account with this email already exists"}}, 409
-
-            if username:
-                existing_username = User.find_by_username(clean_username)
-                if existing_username:
-                    return {"data": {"message": "Username is already taken. Please choose another"}}, 409
+            existing = User.find_by_email(email)
+            if existing:
+                return {"data": {"message": "User with this email already exists"}}, 409
 
             hashed_password = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            new_user = User.create_user(
-                name=name,
-                email=clean_email,
-                password_hash=hashed_password,
-                phone=phone,
-                username=clean_username,
-                current_plan=current_plan,
-                trading_experience=trading_experience,
-                **kwargs
-            )
+            new_user = User.create_user(name=name, email=email, password_hash=hashed_password, phone=phone)
             if not new_user:
                 return {"data": {"message": "Failed to create user"}}, 500
 
@@ -82,15 +59,12 @@ class UserService:
             return {"data": {"message": str(e)}}, 500
 
     @staticmethod
-    def login(identifier, password):
+    def login(email, password):
         try:
-            if not identifier or not password:
-                return {"data": {"message": "Email/username and password are required"}}, 400
-
-            user_obj = User.find_by_email_or_username(identifier)
+            user_obj = User.find_by_email(email)
 
             if not user_obj:
-                return {"data": {"message": "No account found with this email or username"}}, 404
+                return {"data": {"message": "User not found"}}, 404
 
             stored_password = user_obj.get("password")
             if not stored_password:
@@ -106,7 +80,7 @@ class UserService:
                 hashed = (password == user_obj.get("password"))
 
             if not hashed:
-                return {"data": {"message": "Incorrect password. Please try again"}}, 401
+                return {"data": {"message": "Invalid password"}}, 401
 
             # Check if Angel One credentials exist
             has_angle_creds = all([

@@ -13,29 +13,18 @@ def user_register():
     user_data = request.get_json(silent=True) or {}
     logger.info(f"user_register data: {user_data.get('email')}")
 
-    name = (user_data.get("name") or user_data.get("fullName") or "").strip()
-    email = user_data.get("email", "").strip().lower()
-    username = (user_data.get("username") or "").strip().lower()
+    name = user_data.get("name", "").strip()
+    email = user_data.get("email", "").strip()
     password = user_data.get("password", "")
-    phone = (user_data.get("phone") or user_data.get("mobile") or "").strip()
-    current_plan = user_data.get("currentPlan") or user_data.get("plan") or "Free"
-    trading_experience = user_data.get("tradingExperience", "Beginner")
+    phone = user_data.get("phone", "")
 
     if not email or not password:
         return jsonify({"status": "failed", "message": "Email and password are required"}), 400
 
     if not name:
-        name = username or email.split("@")[0]
+        name = email.split("@")[0]
 
-    user_response, status_code = UserService.register(
-        name=name,
-        email=email,
-        password=password,
-        phone=phone,
-        username=username,
-        current_plan=current_plan,
-        trading_experience=trading_experience
-    )
+    user_response, status_code = UserService.register(name, email, password, phone)
     user_response = serialize_mongo(user_response)
     return jsonify(user_response), status_code
 
@@ -43,48 +32,19 @@ def user_register():
 @user_bp.route('/login', methods=['POST'])
 def user_login():
     user_data = request.get_json(silent=True) or {}
-    logger.info(f"user_data: {user_data.get('email') or user_data.get('username')}")
+    logger.info(f"user_data: {user_data}")
     
-    identifier = (user_data.get("email") or user_data.get("username") or user_data.get("identifier") or "").strip()
+    email = user_data.get("email") or user_data.get("username")
     password = user_data.get("password")
 
-    if not identifier or not password:
-        return jsonify({"message": "Missing email/username or password"}), 400
+    if not email or not password:
+        return jsonify({"message": "Missing email or password"}), 400
     
-    user_response, status_code = UserService.login(identifier, password)
+    user_response, status_code = UserService().login(email, password)
+    logger.info(f"user_response: {user_response}, status_code: {status_code}")
     user_response = serialize_mongo(user_response)
+    logger.info(f"Serialized user_response: {user_response}")   
     return jsonify(user_response), status_code
-
-
-@user_bp.route('/me', methods=['GET'])
-def get_current_user():
-    """Get current user details by token or email query param"""
-    auth_header = request.headers.get("Authorization", "")
-    email = request.args.get("email")
-    user_data = None
-
-    if auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-        try:
-            import jwt
-            from app.services.user_services import SECRET_KEY
-            decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            if decoded and decoded.get("email"):
-                from app.models.user import User
-                user_data = User.find_by_email(decoded["email"])
-        except Exception as e:
-            logger.warning(f"Could not decode token: {e}")
-
-    if not user_data and email:
-        from app.models.user import User
-        user_data = User.find_by_email(email)
-
-    if not user_data:
-        return jsonify({"status": "failed", "message": "User not found"}), 404
-
-    user_data.pop("password", None)
-    user_data = serialize_mongo(user_data)
-    return jsonify({"status": "success", "data": user_data}), 200
 
 
 @user_bp.route('/forgot-password', methods=['POST'])

@@ -9,15 +9,9 @@ import os
 import json
 import base64
 import time
-try:
-    from py_vapid import Vapid
-    from cryptography.hazmat.primitives import serialization
-    from pywebpush import webpush, WebPushException
-except ImportError:
-    Vapid = None
-    serialization = None
-    webpush = None
-    WebPushException = Exception
+from py_vapid import Vapid
+from cryptography.hazmat.primitives import serialization
+from pywebpush import webpush, WebPushException
 from app.utils.logger import get_logger
 from app.extensions import connect_to_mongodb
 from app.services.stock_prediction_service import StockPredictionService
