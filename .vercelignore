@@ -1,0 +1,29 @@
+# Large data files
+index_data.json
+index_data.csv
+*.csv
+*.json
+!vercel.json
+!package.json
+
+# Logs and local artifacts
+logs/
+*.log
+gitlog.txt
+*.pem
+
+# Test and dev scripts
+test*.py
+get_logo.py
+old_indexes.py
+
+# Docker & CI
+Dockerfile
+docker-compose.yml
+.git
+.gitignore
+.github
+venv/
+.venv/
+__pycache__/
+*.pyc
