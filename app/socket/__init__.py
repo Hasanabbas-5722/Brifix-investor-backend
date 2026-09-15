@@ -148,7 +148,11 @@ def find_index_token(token_name):
 
     csv_path = BASE_DIR / "index_data.csv"
     df = pd.read_csv(csv_path)
-    df.to_csv("index_data.csv")
+    # Write to /tmp (writable on all platforms including Vercel)
+    try:
+        df.to_csv("/tmp/index_data.csv")
+    except OSError:
+        pass  # Skip write on read-only filesystems
     # logger.info(f"df: {df['symbol'], df['token']}")
     logger.info(f"type of token {token_name}")
     logger.info(f"data: {df[df['symbol'].isin(token_name)]['token'].tolist()}")

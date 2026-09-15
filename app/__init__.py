@@ -19,7 +19,18 @@ from app.utils.logger import get_logger
 
 DIR = Path(__file__).parent
 
-nse = NSE(download_folder=DIR)
+# Vercel's /var/task is read-only; only /tmp is writable at runtime.
+# Use /tmp as the NSE download folder so it can write cookies/cache files.
+_NSE_DOWNLOAD_DIR = Path(os.environ.get("NSE_DOWNLOAD_DIR", "/tmp"))
+try:
+    _NSE_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
+try:
+    nse = NSE(download_folder=_NSE_DOWNLOAD_DIR)
+except Exception as _e:
+    nse = None
 
 logger = get_logger(__name__)
 
@@ -43,6 +54,8 @@ def create_app(config_name=None):
     @app.route("/api/v1/market_status", methods=["GET"])
     def market_status():
         try:
+            if nse is None:
+                raise RuntimeError("NSE client not initialized")
             status = nse.status()
             return jsonify({"market_status": status})
         except Exception as e:

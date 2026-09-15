@@ -1,3 +1,4 @@
+import os
 import time
 from urllib.parse import urlparse
 from pathlib import Path
@@ -91,7 +92,10 @@ def get_nse():
     global _nse_instance
     if _nse_instance is None:
         try:
-            _nse_instance = NSE(download_folder=DIR)
+            # Use /tmp since /var/task is read-only on Vercel serverless
+            _nse_download_dir = Path(os.environ.get("NSE_DOWNLOAD_DIR", "/tmp"))
+            _nse_download_dir.mkdir(parents=True, exist_ok=True)
+            _nse_instance = NSE(download_folder=_nse_download_dir)
         except Exception as e:
             logger.error(f"Failed to initialize NSE: {e}")
     return _nse_instance
