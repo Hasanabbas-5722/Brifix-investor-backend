@@ -3,7 +3,10 @@
   "builds": [
     {
       "src": "main.py",
-      "use": "@vercel/python"
+      "use": "@vercel/python",
+      "config": {
+        "excludeFiles": "venv/**|.venv/**|**/__pycache__/**|*.pyc|*.log|*.csv|*.pem|logs/**|test*.py|get_logo.py|old_indexes.py|Dockerfile|docker-compose.yml|nse_cookies_requests.json|vapid_private.pem"
+      }
     }
   ],
   "routes": [
