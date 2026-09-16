@@ -91,26 +91,26 @@ def is_nse_market_open() -> bool:
         return False
 
 DEFAULT_SEED_QUOTES = {
-    "^NSEI": {'ltp': 25010.50, 'prev': 24960.00, 'open': 24980.00, 'high': 25050.00, 'low': 24920.00, 'vol': 550000},
-    "^NSEBANK": {'ltp': 51420.25, 'prev': 51300.00, 'open': 51320.00, 'high': 51580.00, 'low': 51200.00, 'vol': 380000},
-    "^BSESN": {'ltp': 81750.80, 'prev': 81600.00, 'open': 81650.00, 'high': 81900.00, 'low': 81500.00, 'vol': 250000},
-    "NIFTY_FIN_SERVICE.NS": {'ltp': 23920.10, 'prev': 23850.00, 'open': 23880.00, 'high': 24010.00, 'low': 23820.00, 'vol': 180000},
-    "RELIANCE.NS": {'ltp': 2965.40, 'prev': 2950.00, 'open': 2955.00, 'high': 2980.00, 'low': 2940.00, 'vol': 150000},
-    "TCS.NS": {'ltp': 4192.50, 'prev': 4180.00, 'open': 4185.00, 'high': 4210.00, 'low': 4165.00, 'vol': 110000},
-    "HDFCBANK.NS": {'ltp': 1662.30, 'prev': 1655.00, 'open': 1658.00, 'high': 1670.00, 'low': 1648.00, 'vol': 280000},
-    "INFY.NS": {'ltp': 1888.75, 'prev': 1878.00, 'open': 1882.00, 'high': 1902.00, 'low': 1870.00, 'vol': 190000},
-    "ICICIBANK.NS": {'ltp': 1218.60, 'prev': 1210.00, 'open': 1212.00, 'high': 1225.00, 'low': 1205.00, 'vol': 220000},
-    "SBIN.NS": {'ltp': 818.40, 'prev': 812.00, 'open': 815.00, 'high': 825.00, 'low': 809.00, 'vol': 340000},
-    "BHARTIARTL.NS": {'ltp': 1555.20, 'prev': 1545.00, 'open': 1548.00, 'high': 1565.00, 'low': 1540.00, 'vol': 130000},
-    "ITC.NS": {'ltp': 498.50, 'prev': 495.00, 'open': 496.00, 'high': 502.00, 'low': 493.00, 'vol': 410000},
-    "AXISBANK.NS": {'ltp': 1245.80, 'prev': 1238.00, 'open': 1240.00, 'high': 1255.00, 'low': 1232.00, 'vol': 210000},
-    "BAJFINANCE.NS": {'ltp': 7240.00, 'prev': 7200.00, 'open': 7210.00, 'high': 7280.00, 'low': 7180.00, 'vol': 85000},
-    "WIPRO.NS": {'ltp': 532.80, 'prev': 528.00, 'open': 530.00, 'high': 538.00, 'low': 525.00, 'vol': 175000},
-    "SUNPHARMA.NS": {'ltp': 1835.60, 'prev': 1825.00, 'open': 1828.00, 'high': 1845.00, 'low': 1820.00, 'vol': 95000},
-    "MARUTI.NS": {'ltp': 12480.00, 'prev': 12420.00, 'open': 12450.00, 'high': 12550.00, 'low': 12380.00, 'vol': 65000},
-    "ADANIENT.NS": {'ltp': 2995.00, 'prev': 2980.00, 'open': 2985.00, 'high': 3020.00, 'low': 2960.00, 'vol': 140000},
-    "LT.NS": {'ltp': 3620.00, 'prev': 3600.00, 'open': 3610.00, 'high': 3645.00, 'low': 3590.00, 'vol': 88000},
-    "KOTAKBANK.NS": {'ltp': 1785.50, 'prev': 1775.00, 'open': 1780.00, 'high': 1795.00, 'low': 1770.00, 'vol': 160000},
+    "^NSEI": {'ltp': 23200.00, 'prev': 23118.60, 'open': 23150.00, 'high': 23250.00, 'low': 23100.00, 'vol': 550000},
+    "^NSEBANK": {'ltp': 55990.00, 'prev': 55794.75, 'open': 55800.00, 'high': 56150.00, 'low': 55700.00, 'vol': 380000},
+    "^BSESN": {'ltp': 74360.00, 'prev': 74003.80, 'open': 74100.00, 'high': 74550.00, 'low': 73950.00, 'vol': 250000},
+    "NIFTY_FIN_SERVICE.NS": {'ltp': 25120.00, 'prev': 25076.65, 'open': 25080.00, 'high': 25200.00, 'low': 25020.00, 'vol': 180000},
+    "RELIANCE.NS": {'ltp': 1251.00, 'prev': 1235.30, 'open': 1240.00, 'high': 1260.00, 'low': 1230.00, 'vol': 150000},
+    "TCS.NS": {'ltp': 2236.00, 'prev': 2251.00, 'open': 2245.00, 'high': 2265.00, 'low': 2225.00, 'vol': 110000},
+    "HDFCBANK.NS": {'ltp': 716.30, 'prev': 716.55, 'open': 717.00, 'high': 722.00, 'low': 714.00, 'vol': 280000},
+    "INFY.NS": {'ltp': 1080.30, 'prev': 1077.00, 'open': 1078.00, 'high': 1090.00, 'low': 1072.00, 'vol': 190000},
+    "ICICIBANK.NS": {'ltp': 1351.60, 'prev': 1350.40, 'open': 1350.00, 'high': 1362.00, 'low': 1345.00, 'vol': 220000},
+    "SBIN.NS": {'ltp': 979.70, 'prev': 968.00, 'open': 970.00, 'high': 988.00, 'low': 965.00, 'vol': 340000},
+    "BHARTIARTL.NS": {'ltp': 1824.20, 'prev': 1830.40, 'open': 1830.00, 'high': 1845.00, 'low': 1815.00, 'vol': 130000},
+    "ITC.NS": {'ltp': 262.15, 'prev': 258.00, 'open': 259.00, 'high': 265.00, 'low': 256.00, 'vol': 410000},
+    "AXISBANK.NS": {'ltp': 1234.50, 'prev': 1222.90, 'open': 1225.00, 'high': 1245.00, 'low': 1220.00, 'vol': 210000},
+    "BAJFINANCE.NS": {'ltp': 1011.90, 'prev': 1009.20, 'open': 1010.00, 'high': 1025.00, 'low': 1005.00, 'vol': 85000},
+    "WIPRO.NS": {'ltp': 169.10, 'prev': 170.00, 'open': 170.00, 'high': 173.00, 'low': 167.00, 'vol': 175000},
+    "SUNPHARMA.NS": {'ltp': 1851.30, 'prev': 1835.00, 'open': 1838.00, 'high': 1865.00, 'low': 1830.00, 'vol': 95000},
+    "MARUTI.NS": {'ltp': 12328.00, 'prev': 12231.00, 'open': 12250.00, 'high': 12450.00, 'low': 12200.00, 'vol': 65000},
+    "ADANIENT.NS": {'ltp': 2931.70, 'prev': 2928.60, 'open': 2930.00, 'high': 2960.00, 'low': 2910.00, 'vol': 140000},
+    "LT.NS": {'ltp': 3827.80, 'prev': 3850.70, 'open': 3850.00, 'high': 3880.00, 'low': 3810.00, 'vol': 88000},
+    "KOTAKBANK.NS": {'ltp': 410.20, 'prev': 409.80, 'open': 410.00, 'high': 416.00, 'low': 407.00, 'vol': 160000},
 }
 
 _shared_quotes = dict(DEFAULT_SEED_QUOTES)
@@ -227,9 +227,12 @@ def _run_index_feeder():
                     # Broadcast index updates to room 'indexes'
                     if is_index:
                         socketio.emit("indexes_data", tick_payload, room='indexes')
+                        # Broadcast to chart rooms (token, display_name, ticker_sym)
+                        socketio.emit("indexes_data", tick_payload, room=f"chart_{token_id}_1d")
+                        socketio.emit("indexes_data", tick_payload, room=f"chart_{display_name}_1d")
+                        socketio.emit("indexes_data", tick_payload, room=f"chart_{ticker_sym}_1d")
                     else:
                         socketio.emit("stock_price", tick_payload, room='indexes')
-                        socketio.emit("indexes_data", tick_payload, room='indexes')
                         stock_movers.append({
                             "symbol": token_id,
                             "companyName": display_name,
@@ -237,13 +240,9 @@ def _run_index_feeder():
                             "change": change,
                             "pChange": p_change
                         })
-
-                    # Broadcast to chart rooms (token, display_name, ticker_sym)
-                    socketio.emit("indexes_data", tick_payload, room=f"chart_{token_id}_1d")
-                    socketio.emit("indexes_data", tick_payload, room=f"chart_{display_name}_1d")
-                    socketio.emit("indexes_data", tick_payload, room=f"chart_{ticker_sym}_1d")
-                    socketio.emit("stock_price", tick_payload, room=f"chart_{token_id}_1d")
-                    socketio.emit("stock_price", tick_payload, room=f"chart_{display_name}_1d")
+                        socketio.emit("stock_price", tick_payload, room=f"chart_{token_id}_1d")
+                        socketio.emit("stock_price", tick_payload, room=f"chart_{display_name}_1d")
+                        socketio.emit("stock_price", tick_payload, room=f"chart_{ticker_sym}_1d")
 
                     # Feed tick into real-time candle manager
                     now_ts = time.time()
@@ -537,7 +536,7 @@ def handle_chart_data(data):
         logger.info(f"Joined client {request.sid} to chart rooms: {room_token}, {room_symbol}")
 
         request_key = f"{request.sid}_chart"
-        chart_connections[request_key] = room_token
+        chart_connections[request_key] = [room_token, room_symbol]
 
         # 3. Optional: If user has SmartAPI credentials, subscribe to broker feed
         user = getattr(request, 'user', None) or {}
@@ -630,7 +629,23 @@ def handle_unsubscribe_chart(data=None):
     logger.info(f"Client {request.sid} unsubscribed from chart: {data}")
     
     chart_key = f"{request.sid}_chart"
-    room_name = chart_connections.pop(chart_key, None)
-    if room_name:
-        leave_room(room_name)
-        logger.info(f"Left chart room: {room_name}")
+    rooms = chart_connections.pop(chart_key, [])
+    if isinstance(rooms, str):
+        rooms = [rooms]
+
+    if data and isinstance(data, dict):
+        sym = data.get('symbol')
+        interval = data.get('interval', '1d')
+        if sym:
+            tok, _ = resolve_symbol_to_token(sym)
+            if tok:
+                rooms.append(f"chart_{tok}_{interval}")
+            rooms.append(f"chart_{sym}_{interval}")
+
+    for room_name in set(rooms):
+        if room_name:
+            try:
+                leave_room(room_name)
+                logger.info(f"Left chart room: {room_name}")
+            except Exception:
+                pass

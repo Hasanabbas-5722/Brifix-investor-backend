@@ -233,9 +233,13 @@ def get_chart_data():
         # Prime the real-time candle manager with these historical candles
         try:
             from app.services.realtime_candle_manager import realtime_candle_manager
+            from app.socket.indexes import resolve_symbol_to_token
             realtime_candle_manager.get_aggregator(raw_symbol, interval).prime_history(candles)
             if ticker_sym != raw_symbol:
                 realtime_candle_manager.get_aggregator(ticker_sym, interval).prime_history(candles)
+            token_id, _ = resolve_symbol_to_token(raw_symbol)
+            if token_id and token_id not in (raw_symbol, ticker_sym):
+                realtime_candle_manager.get_aggregator(token_id, interval).prime_history(candles)
         except Exception as seed_err:
             logger.debug(f"Could not prime candle manager: {seed_err}")
 
