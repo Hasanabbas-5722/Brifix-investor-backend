@@ -311,6 +311,11 @@ class StockPredictionService:
     Returns fully JSON-serializable dicts.
     """
 
+    @classmethod
+    def get_daily_picks(cls) -> list:
+        """Alias for get_daily_recommendations."""
+        return cls.get_daily_recommendations()
+
     @staticmethod
     def get_daily_recommendations() -> list:
         """

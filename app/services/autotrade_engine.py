@@ -177,7 +177,7 @@ class AutoTradeEngine:
         entry = float(pos["entryPrice"])
 
         user_doc = db.users.find_one({"_id": ObjectId(user_id)}) if ObjectId.is_valid(user_id) else None
-        broker = get_broker_for_user(user_doc)
+        broker = get_broker_for_user(user_doc, user_id=str(user_id), trade_mode=pos.get("tradeMode", "paper"))
 
         # Place SELL order
         sell_res = broker.place_order(symbol, "SELL", qty, exit_price)
@@ -268,88 +268,119 @@ class AutoTradeEngine:
 
             time.sleep(5.0)
 
-    def _scan_and_execute_signals(self, enabled_users: list):
-        """Evaluate AI recommendations against active user capital and risk parameters."""
+    def evaluate_user(self, user_id: str):
+        """Evaluate positions and signals for a user immediately."""
+        uid = str(user_id)
+        cfg = self.get_user_config(uid)
+        if not cfg.get("enabled", False):
+            return
+
+        # 1. Update/check open positions against latest market prices
+        open_pos = list(db.autotrade_positions.find({"userId": uid, "status": "OPEN"}))
         from app.socket.indexes import _shared_quotes
 
-        # Load daily picks from prediction service
+        for pos in open_pos:
+            sym = pos["symbol"]
+            q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
+            ltp = float(q.get("ltp", 0))
+            if ltp > 0:
+                self.on_tick(sym, ltp)
+
+        # 2. Check if we have room for new positions
+        max_open = int(cfg.get("maxOpenTrades", 3))
+        open_count = db.autotrade_positions.count_documents({"userId": uid, "status": "OPEN"})
+        if open_count >= max_open:
+            return
+
+        # 3. Check intraday square-off time (after 3:15 PM IST)
+        ist_now = get_ist_time()
+        if (ist_now.hour == 15 and ist_now.minute >= 15) or (ist_now.hour > 15):
+            return
+
+        # 4. Fetch daily recommendations from StockPredictionService
         try:
             from app.services.stock_prediction_service import StockPredictionService
-            daily_picks = StockPredictionService.get_daily_picks()
-        except Exception:
+            daily_picks = StockPredictionService.get_daily_recommendations()
+        except Exception as e:
+            logger.error(f"[AutoTradeEngine] Error fetching recommendations: {e}")
             daily_picks = []
 
         if not daily_picks:
             return
 
-        for u_cfg in enabled_users:
-            user_id = u_cfg["userId"]
-            max_open = int(u_cfg.get("maxOpenTrades", 3))
+        user_doc = db.users.find_one({"_id": ObjectId(uid)}) if ObjectId.is_valid(uid) else None
+        trade_mode = cfg.get("tradeMode", "paper")
+        broker = get_broker_for_user(user_doc, user_id=uid, trade_mode=trade_mode)
+        margin = broker.get_margin()
+        avail_cash = float(margin.get("available_cash", 0.0))
 
-            # Count current open positions
-            open_count = db.autotrade_positions.count_documents({"userId": user_id, "status": "OPEN"})
+        for pick in daily_picks:
             if open_count >= max_open:
+                break
+
+            sym = pick.get("symbol", "").upper()
+            rating = pick.get("action", "").upper() or pick.get("signal", "").upper()
+            conf = float(pick.get("confidence", 0) or 0)
+
+            # High probability criteria: confidence >= 70% and BUY recommendation
+            if "BUY" not in rating or conf < 70:
                 continue
 
-            user_doc = db.users.find_one({"_id": ObjectId(user_id)}) if ObjectId.is_valid(user_id) else None
-            broker = get_broker_for_user(user_doc)
-            margin = broker.get_margin()
-            avail_cash = float(margin.get("available_cash", 0.0))
+            # Check if position already exists for this symbol
+            existing = db.autotrade_positions.find_one({"userId": uid, "symbol": sym, "status": "OPEN"})
+            if existing:
+                continue
 
-            for pick in daily_picks:
-                if open_count >= max_open:
-                    break
+            q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
+            ltp = float(q.get("ltp") or pick.get("current_price") or pick.get("currentPrice") or 0)
+            if ltp <= 0:
+                continue
 
-                sym = pick.get("symbol", "").upper()
-                rating = pick.get("action", "").upper() or pick.get("signal", "").upper()
-                conf = float(pick.get("confidence", 0) or 0)
+            max_alloc = min(float(cfg.get("maxCapitalPerTrade", 10000.0)), avail_cash)
+            qty = int(max_alloc / ltp)
+            if qty <= 0 and avail_cash >= ltp:
+                qty = 1
 
-                # High probability criteria: confidence >= 75% and BUY recommendation
-                if "BUY" not in rating or conf < 75:
-                    continue
+            if qty <= 0:
+                continue
 
-                # Check if position already exists for this symbol
-                existing = db.autotrade_positions.find_one({"userId": user_id, "symbol": sym, "status": "OPEN"})
-                if existing:
-                    continue
+            # Calculate Risk-Reward parameters
+            sl_pct = float(cfg.get("stopLossPct", 1.5))
+            rr = float(cfg.get("riskRewardRatio", 2.0))
+            tp_pct = round(sl_pct * rr, 2)
 
-                q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
-                ltp = float(q.get("ltp", pick.get("currentPrice", 0)))
-                if ltp <= 0:
-                    continue
+            sl_price = round(ltp * (1 - sl_pct / 100), 2)
+            target_price = round(ltp * (1 + tp_pct / 100), 2)
 
-                max_alloc = min(float(u_cfg.get("maxCapitalPerTrade", 10000.0)), avail_cash)
-                qty = int(max_alloc / ltp)
-                if qty <= 0:
-                    continue
+            # Place BUY order
+            buy_res = broker.place_order(sym, "BUY", qty, ltp)
+            if buy_res.get("status") == "success":
+                db.autotrade_positions.insert_one({
+                    "userId": uid,
+                    "symbol": sym,
+                    "quantity": qty,
+                    "entryPrice": ltp,
+                    "stopLossPrice": sl_price,
+                    "targetPrice": target_price,
+                    "highestPrice": ltp,
+                    "status": "OPEN",
+                    "tradeMode": trade_mode,
+                    "aiConfidence": conf,
+                    "entryTime": datetime.utcnow()
+                })
+                open_count += 1
+                avail_cash -= (ltp * qty)
+                logger.info(f"[AutoTradeEngine] Executed Auto BUY for {uid}: {qty}x {sym} @ ₹{ltp} | SL: ₹{sl_price} (-{sl_pct}%) | TP: ₹{target_price} (+{tp_pct}%)")
 
-                # Calculate Risk-Reward parameters
-                sl_pct = float(u_cfg.get("stopLossPct", 1.5))
-                rr = float(u_cfg.get("riskRewardRatio", 2.0))
-                tp_pct = sl_pct * rr
-
-                sl_price = round(ltp * (1 - sl_pct / 100), 2)
-                target_price = round(ltp * (1 + tp_pct / 100), 2)
-
-                # Place BUY order
-                buy_res = broker.place_order(sym, "BUY", qty, ltp)
-                if buy_res.get("status") == "success":
-                    db.autotrade_positions.insert_one({
-                        "userId": user_id,
-                        "symbol": sym,
-                        "quantity": qty,
-                        "entryPrice": ltp,
-                        "stopLossPrice": sl_price,
-                        "targetPrice": target_price,
-                        "highestPrice": ltp,
-                        "status": "OPEN",
-                        "tradeMode": u_cfg.get("tradeMode", "paper"),
-                        "aiConfidence": conf,
-                        "entryTime": datetime.utcnow()
-                    })
-                    open_count += 1
-                    avail_cash -= (ltp * qty)
-                    logger.info(f"[AutoTradeEngine] Executed Auto BUY: {qty}x {sym} @ ₹{ltp} | SL: ₹{sl_price} (-{sl_pct}%) | TP: ₹{target_price} (+{tp_pct}%)")
+    def _scan_and_execute_signals(self, enabled_users: list):
+        """Evaluate AI recommendations against active user capital and risk parameters."""
+        for u_cfg in enabled_users:
+            user_id = u_cfg.get("userId")
+            if user_id:
+                try:
+                    self.evaluate_user(user_id)
+                except Exception as e:
+                    logger.error(f"[AutoTradeEngine] Error evaluating user {user_id}: {e}")
 
 
 # Global singleton instance

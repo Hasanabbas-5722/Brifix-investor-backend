@@ -429,12 +429,17 @@ class GrowwBroker(BaseBroker):
             return []
 
 
-def get_broker_for_user(user_doc: dict) -> BaseBroker:
+def get_broker_for_user(user_doc: dict = None, user_id: str = None, trade_mode: str = None) -> BaseBroker:
     """Instantiate appropriate broker instance based on user's saved credentials and configuration."""
-    if not user_doc:
-        return PaperTradingBroker("anonymous")
+    uid = str(user_id or (user_doc.get("_id") if user_doc else None) or (user_doc.get("id") if user_doc else None) or "demo")
 
-    user_id = str(user_doc.get("_id") or user_doc.get("id") or "demo")
+    # If explicitly in paper mode or trade_mode is paper, always return PaperTradingBroker
+    if trade_mode == "paper":
+        return PaperTradingBroker(uid)
+
+    if not user_doc:
+        return PaperTradingBroker(uid)
+
     active_broker = user_doc.get("activeBroker", "paper").lower()
 
     if active_broker == "angelone":
@@ -447,7 +452,7 @@ def get_broker_for_user(user_doc: dict) -> BaseBroker:
             try:
                 return AngelOneBroker(code, pin, totp, api_key)
             except Exception as e:
-                logger.warning(f"Angel One session failed for {user_id}, falling back to Paper: {e}")
+                logger.warning(f"Angel One session failed for {uid}, falling back to Paper: {e}")
 
     elif active_broker == "groww":
         api_key = decrypt_val(user_doc.get("growwApiKey", ""))
@@ -457,6 +462,6 @@ def get_broker_for_user(user_doc: dict) -> BaseBroker:
             try:
                 return GrowwBroker(api_key, totp)
             except Exception as e:
-                logger.warning(f"Groww session failed for {user_id}, falling back to Paper: {e}")
+                logger.warning(f"Groww session failed for {uid}, falling back to Paper: {e}")
 
-    return PaperTradingBroker(user_id)
+    return PaperTradingBroker(uid)

@@ -37,6 +37,13 @@ def toggle_auto_trade():
     # Make sure engine loop is running
     autotrade_engine.start()
 
+    # If enabled, evaluate immediately so user gets trades executed without delay
+    if enable:
+        try:
+            autotrade_engine.evaluate_user(uid)
+        except Exception as e:
+            logger.error(f"Error during on-demand autotrade evaluation: {e}")
+
     return jsonify({
         "status": "success",
         "enabled": cfg.get("enabled", False),
@@ -82,6 +89,14 @@ def get_open_positions():
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
+
+    # If automation is active for this user, evaluate breakout recommendations & position status
+    cfg = autotrade_engine.get_user_config(uid)
+    if cfg.get("enabled", False):
+        try:
+            autotrade_engine.evaluate_user(uid)
+        except Exception as eval_err:
+            logger.debug(f"Position sync evaluation: {eval_err}")
 
     docs = list(db.autotrade_positions.find({"userId": uid, "status": "OPEN"}).sort("entryTime", -1))
     from app.socket.indexes import _shared_quotes
