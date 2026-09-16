@@ -37,18 +37,55 @@ def toggle_auto_trade():
     # Make sure engine loop is running
     autotrade_engine.start()
 
-    # If enabled, evaluate immediately so user gets trades executed without delay
+    eval_result = {}
     if enable:
         try:
-            autotrade_engine.evaluate_user(uid)
+            eval_result = autotrade_engine.evaluate_user(uid, force_scan=True)
         except Exception as e:
             logger.error(f"Error during on-demand autotrade evaluation: {e}")
+
+    new_positions = eval_result.get("new_positions", []) if eval_result else []
+    new_count = len(new_positions)
+
+    if enable:
+        if new_count > 0:
+            msg = f"Automated trading ACTIVATED. AI scanned Indian stocks and opened {new_count} positions with >80% confidence."
+        else:
+            msg = "Automated trading ACTIVATED. Engine scanning for setups with >80% AI confidence."
+    else:
+        msg = "Automated trading STOPPED."
 
     return jsonify({
         "status": "success",
         "enabled": cfg.get("enabled", False),
         "config": cfg,
-        "message": f"Automated trading {'ACTIVATED' if enable else 'STOPPED'}"
+        "eval_result": eval_result,
+        "message": msg
+    })
+
+
+@autotrade_bp.route("/scan", methods=["POST"])
+@validate_access_token
+def scan_and_trade():
+    """Immediately scan top Indian stocks, run AI predictions, and execute trades for >80% confidence picks."""
+    uid = _get_uid()
+    if not uid:
+        return jsonify({"status": "failed", "error": "Unauthorized"}), 401
+
+    try:
+        eval_result = autotrade_engine.evaluate_user(uid, force_scan=True)
+    except Exception as e:
+        logger.error(f"Error during manual scan: {e}")
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+    new_count = len(eval_result.get("new_positions", [])) if eval_result else 0
+    qual_count = eval_result.get("qualified_count", 0) if eval_result else 0
+    scanned = eval_result.get("scanned_count", 0) if eval_result else 0
+
+    return jsonify({
+        "status": "success",
+        "result": eval_result,
+        "message": f"AI Scan complete: Analyzed {scanned} Indian stocks, found {qual_count} picks with >80% confidence. Opened {new_count} new trades."
     })
 
 

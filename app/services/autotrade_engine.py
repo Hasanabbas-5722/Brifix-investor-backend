@@ -268,12 +268,16 @@ class AutoTradeEngine:
 
             time.sleep(5.0)
 
-    def evaluate_user(self, user_id: str):
-        """Evaluate positions and signals for a user immediately."""
+    def evaluate_user(self, user_id: str, force_scan: bool = False):
+        """
+        Evaluate positions and signals for a user immediately.
+        Screens Indian stocks, applies AI predictions, checks confidence >= 80%,
+        and executes auto-trades for qualified setups.
+        """
         uid = str(user_id)
         cfg = self.get_user_config(uid)
-        if not cfg.get("enabled", False):
-            return
+        if not cfg.get("enabled", False) and not force_scan:
+            return {"status": "disabled", "message": "Automated trading is disabled for this user."}
 
         # 1. Update/check open positions against latest market prices
         open_pos = list(db.autotrade_positions.find({"userId": uid, "status": "OPEN"}))
@@ -290,14 +294,33 @@ class AutoTradeEngine:
         max_open = int(cfg.get("maxOpenTrades", 3))
         open_count = db.autotrade_positions.count_documents({"userId": uid, "status": "OPEN"})
         if open_count >= max_open:
-            return
+            return {
+                "status": "max_positions_reached",
+                "open_count": open_count,
+                "max_open": max_open,
+                "message": f"Maximum open positions ({max_open}) already active."
+            }
 
-        # 3. Check intraday square-off time (after 3:15 PM IST)
+        # 3. Market session check
+        trade_mode = cfg.get("tradeMode", "paper")
         ist_now = get_ist_time()
-        if (ist_now.hour == 15 and ist_now.minute >= 15) or (ist_now.hour > 15):
-            return
+        is_square_off_time = (ist_now.hour == 15 and ist_now.minute >= 15) or (ist_now.hour > 15)
 
-        # 4. Fetch daily recommendations from StockPredictionService
+        # Only restrict live exchange execution to market hours (paper simulation is unrestricted)
+        if trade_mode != "paper":
+            is_market_closed = (
+                is_square_off_time or
+                (ist_now.hour < 9) or
+                (ist_now.hour == 9 and ist_now.minute < 15) or
+                (ist_now.weekday() >= 5)
+            )
+            if is_market_closed:
+                return {
+                    "status": "market_closed",
+                    "message": "Live Indian market is closed. Orders can only be placed 09:15 - 15:15 IST on trading days."
+                }
+
+        # 4. Fetch AI recommendations for Indian stocks
         try:
             from app.services.stock_prediction_service import StockPredictionService
             daily_picks = StockPredictionService.get_daily_recommendations()
@@ -306,25 +329,32 @@ class AutoTradeEngine:
             daily_picks = []
 
         if not daily_picks:
-            return
+            return {"status": "no_signals", "message": "No active signals returned from AI prediction model."}
+
+        # Sort candidate picks descending by confidence
+        daily_picks = sorted(daily_picks, key=lambda x: float(x.get("confidence", 0) or 0), reverse=True)
 
         user_doc = db.users.find_one({"_id": ObjectId(uid)}) if ObjectId.is_valid(uid) else None
-        trade_mode = cfg.get("tradeMode", "paper")
         broker = get_broker_for_user(user_doc, user_id=uid, trade_mode=trade_mode)
         margin = broker.get_margin()
         avail_cash = float(margin.get("available_cash", 0.0))
+
+        created_positions = []
+        qualified_picks = []
 
         for pick in daily_picks:
             if open_count >= max_open:
                 break
 
             sym = pick.get("symbol", "").upper()
-            rating = pick.get("action", "").upper() or pick.get("signal", "").upper()
+            rating = str(pick.get("action", "") or pick.get("signal", "")).upper()
             conf = float(pick.get("confidence", 0) or 0)
 
-            # High probability criteria: confidence >= 70% and BUY recommendation
-            if "BUY" not in rating or conf < 70:
+            # STRICT USER RULE: Only pick stocks with confidence >= 80% and BUY signal
+            if "BUY" not in rating or conf < 80.0:
                 continue
+
+            qualified_picks.append({"symbol": sym, "confidence": conf, "rating": rating})
 
             # Check if position already exists for this symbol
             existing = db.autotrade_positions.find_one({"userId": uid, "symbol": sym, "status": "OPEN"})
@@ -352,10 +382,10 @@ class AutoTradeEngine:
             sl_price = round(ltp * (1 - sl_pct / 100), 2)
             target_price = round(ltp * (1 + tp_pct / 100), 2)
 
-            # Place BUY order
+            # Place BUY order through broker
             buy_res = broker.place_order(sym, "BUY", qty, ltp)
             if buy_res.get("status") == "success":
-                db.autotrade_positions.insert_one({
+                new_pos = {
                     "userId": uid,
                     "symbol": sym,
                     "quantity": qty,
@@ -367,20 +397,28 @@ class AutoTradeEngine:
                     "tradeMode": trade_mode,
                     "aiConfidence": conf,
                     "entryTime": datetime.utcnow()
-                })
+                }
+                res = db.autotrade_positions.insert_one(new_pos)
+                new_pos["id"] = str(res.inserted_id)
+                new_pos.pop("_id", None)
+                created_positions.append(new_pos)
+
                 open_count += 1
                 avail_cash -= (ltp * qty)
-                logger.info(f"[AutoTradeEngine] Executed Auto BUY for {uid}: {qty}x {sym} @ ₹{ltp} | SL: ₹{sl_price} (-{sl_pct}%) | TP: ₹{target_price} (+{tp_pct}%)")
+                logger.info(
+                    f"[AutoTradeEngine] Executed Auto BUY for {uid}: {qty}x {sym} @ Rs.{ltp} (AI Conf: {conf}%) | "
+                    f"SL: Rs.{sl_price} (-{sl_pct}%) | TP: Rs.{target_price} (+{tp_pct}%)"
+                )
 
-    def _scan_and_execute_signals(self, enabled_users: list):
-        """Evaluate AI recommendations against active user capital and risk parameters."""
-        for u_cfg in enabled_users:
-            user_id = u_cfg.get("userId")
-            if user_id:
-                try:
-                    self.evaluate_user(user_id)
-                except Exception as e:
-                    logger.error(f"[AutoTradeEngine] Error evaluating user {user_id}: {e}")
+        return {
+            "status": "success",
+            "open_count": open_count,
+            "max_open": max_open,
+            "scanned_count": len(daily_picks),
+            "qualified_count": len(qualified_picks),
+            "qualified_picks": qualified_picks,
+            "new_positions": created_positions
+        }
 
 
 # Global singleton instance

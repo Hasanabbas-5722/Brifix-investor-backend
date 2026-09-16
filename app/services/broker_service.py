@@ -145,7 +145,7 @@ class PaperTradingBroker(BaseBroker):
             "timestamp": datetime.utcnow()
         }
         db.paper_orders.insert_one(order_doc)
-        logger.info(f"[PaperBroker] Executed {transaction_type} {quantity}x {clean_sym} @ ₹{fill_price}")
+        logger.info(f"[PaperBroker] Executed {transaction_type} {quantity}x {clean_sym} @ Rs.{fill_price}")
 
         return {
             "status": "success",
@@ -153,7 +153,7 @@ class PaperTradingBroker(BaseBroker):
             "fill_price": fill_price,
             "quantity": quantity,
             "order_value": order_val,
-            "message": f"Paper order executed for {quantity}x {clean_sym} @ ₹{fill_price}"
+            "message": f"Paper order executed for {quantity}x {clean_sym} @ Rs.{fill_price}"
         }
 
     def get_orders(self) -> list:

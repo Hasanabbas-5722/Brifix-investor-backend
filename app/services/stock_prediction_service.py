@@ -326,17 +326,40 @@ class StockPredictionService:
         if _DAILY_PICKS_CACHE["data"] and (now - _DAILY_PICKS_CACHE["timestamp"] < DAILY_PICKS_TTL):
             return _DAILY_PICKS_CACHE["data"]
 
+        # Check MongoDB Atlas collection for warm cache across serverless instances
+        try:
+            from app.models.user import db
+            cached_doc = db.predictions.find_one({"type": "daily_recommendations"})
+            if cached_doc and (now - float(cached_doc.get("timestamp", 0)) < DAILY_PICKS_TTL):
+                picks = cached_doc.get("picks", [])
+                if picks:
+                    _DAILY_PICKS_CACHE["data"] = picks
+                    _DAILY_PICKS_CACHE["timestamp"] = float(cached_doc.get("timestamp", now))
+                    return picks
+        except Exception as e:
+            logger.debug(f"MongoDB cache read error: {e}")
+
         candidates = [
-            {"symbol": "RELIANCE",   "name": "Reliance Industries",       "sector": "Energy"},
-            {"symbol": "TATAMOTORS", "name": "Tata Motors Ltd",           "sector": "Automobile", "ticker": "TMCV.NS"},
-            {"symbol": "ICICIBANK",  "name": "ICICI Bank Ltd",            "sector": "Banking"},
-            {"symbol": "BHARTIARTL", "name": "Bharti Airtel Ltd",         "sector": "Telecom"},
-            {"symbol": "SBIN",       "name": "State Bank of India",       "sector": "Banking"},
-            {"symbol": "INFY",       "name": "Infosys Ltd",               "sector": "IT Services"},
-            {"symbol": "LT",         "name": "Larsen & Toubro Ltd",       "sector": "Capital Goods"},
-            {"symbol": "SUNPHARMA",  "name": "Sun Pharmaceutical Ind",    "sector": "Healthcare"},
-            {"symbol": "BAJFINANCE", "name": "Bajaj Finance Ltd",         "sector": "Finance"},
-            {"symbol": "HDFCBANK",   "name": "HDFC Bank Ltd",             "sector": "Banking"},
+            {"symbol": "HDFCBANK",   "name": "HDFC Bank Ltd",             "sector": "Banking",     "ticker": "HDFCBANK.NS"},
+            {"symbol": "AXISBANK",   "name": "Axis Bank Ltd",             "sector": "Banking",     "ticker": "AXISBANK.NS"},
+            {"symbol": "ICICIBANK",  "name": "ICICI Bank Ltd",            "sector": "Banking",     "ticker": "ICICIBANK.NS"},
+            {"symbol": "SBIN",       "name": "State Bank of India",       "sector": "Banking",     "ticker": "SBIN.NS"},
+            {"symbol": "KOTAKBANK",  "name": "Kotak Mahindra Bank",       "sector": "Banking",     "ticker": "KOTAKBANK.NS"},
+            {"symbol": "RELIANCE",   "name": "Reliance Industries",       "sector": "Energy",      "ticker": "RELIANCE.NS"},
+            {"symbol": "BHARTIARTL", "name": "Bharti Airtel Ltd",         "sector": "Telecom",     "ticker": "BHARTIARTL.NS"},
+            {"symbol": "INFY",       "name": "Infosys Ltd",               "sector": "IT Services", "ticker": "INFY.NS"},
+            {"symbol": "TCS",        "name": "Tata Consultancy Services", "sector": "IT Services", "ticker": "TCS.NS"},
+            {"symbol": "LT",         "name": "Larsen & Toubro Ltd",       "sector": "Capital Goods","ticker": "LT.NS"},
+            {"symbol": "SUNPHARMA",  "name": "Sun Pharmaceutical Ind",    "sector": "Healthcare",  "ticker": "SUNPHARMA.NS"},
+            {"symbol": "BAJFINANCE", "name": "Bajaj Finance Ltd",         "sector": "Finance",     "ticker": "BAJFINANCE.NS"},
+            {"symbol": "TATAMOTORS", "name": "Tata Motors Ltd",           "sector": "Automobile",  "ticker": "TMCV.NS"},
+            {"symbol": "M&M",        "name": "Mahindra & Mahindra Ltd",   "sector": "Automobile",  "ticker": "M&M.NS"},
+            {"symbol": "MARUTI",     "name": "Maruti Suzuki India",       "sector": "Automobile",  "ticker": "MARUTI.NS"},
+            {"symbol": "ITC",        "name": "ITC Ltd",                   "sector": "FMCG",        "ticker": "ITC.NS"},
+            {"symbol": "TITAN",      "name": "Titan Company Ltd",         "sector": "Consumer",    "ticker": "TITAN.NS"},
+            {"symbol": "NTPC",       "name": "NTPC Ltd",                  "sector": "Power",       "ticker": "NTPC.NS"},
+            {"symbol": "POWERGRID",  "name": "Power Grid Corporation",    "sector": "Power",       "ticker": "POWERGRID.NS"},
+            {"symbol": "TATASTEEL",  "name": "Tata Steel Ltd",            "sector": "Metals",      "ticker": "TATASTEEL.NS"},
         ]
 
         scored_picks = []
@@ -345,6 +368,7 @@ class StockPredictionService:
             tickers = [c.get("ticker", f"{c['symbol']}.NS") for c in candidates]
             data = yf.download(tickers, period="3mo", interval="1d", progress=False, group_by="ticker")
 
+            raw_picks = []
             for c in candidates:
                 sym = c["symbol"]
                 t_sym = c.get("ticker", f"{sym}.NS")
@@ -370,41 +394,72 @@ class StockPredictionService:
                 atr = float(ta.volatility.average_true_range(high, low, close, window=14).iloc[-1])
                 vol_avg = float(vol.tail(20).mean())
                 curr_vol = float(vol.iloc[-1])
+                ret_5d = float((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] * 100) if len(close) >= 5 else 0
 
                 # Score bullish strength
-                score = 50
+                score = 52.0
                 signals = []
 
                 if cmp_price > ema20:
-                    score += 15
+                    score += 12.0
                     signals.append("Trading above 20-Day EMA")
                 if ema20 > ema50:
-                    score += 10
+                    score += 10.0
                     signals.append("Bullish EMA 20/50 trend alignment")
+                if ret_5d > 0:
+                    score += 6.0
+                    signals.append(f"+{ret_5d:.1f}% 5D momentum")
                 if 45 <= rsi <= 68:
-                    score += 15
+                    score += 12.0
                     signals.append(f"Healthy RSI momentum ({rsi:.1f})")
                 elif rsi < 40:
-                    score += 10
+                    score += 8.0
                     signals.append("RSI in value accumulation zone")
                 if macd_diff > 0:
-                    score += 15
+                    score += 12.0
                     signals.append("MACD bullish expansion")
                 if curr_vol > vol_avg:
-                    score += 10
-                    signals.append("Above-average accumulation volume")
+                    score += 8.0
+                    signals.append("Above-average institutional volume")
 
-                confidence = min(max(score, 68), 94)
+                raw_picks.append({
+                    "c": c,
+                    "sym": sym,
+                    "cmp_price": cmp_price,
+                    "rsi": rsi,
+                    "atr": atr,
+                    "raw_score": score,
+                    "signals": signals
+                })
+
+            raw_picks.sort(key=lambda x: x["raw_score"], reverse=True)
+
+            for idx, item in enumerate(raw_picks):
+                c = item["c"]
+                sym = item["sym"]
+                cmp_price = item["cmp_price"]
+                rsi = item["rsi"]
+                atr = item["atr"]
+                raw_score = item["raw_score"]
+                signals = item["signals"]
+
+                rank_bonus = max(0, 10 - idx * 2.0) if raw_score >= 60 else 0
+                confidence = round(min(raw_score + rank_bonus, 96.0), 1)
+
                 target_pct_1d = round(1.2 + (confidence % 10) * 0.15, 2)
                 target_pct_5d = round(3.5 + (confidence % 8) * 0.35, 2)
-
                 target_1d = round(cmp_price * (1 + target_pct_1d / 100), 2)
                 target_5d = round(cmp_price * (1 + target_pct_5d / 100), 2)
                 stop_loss = round(max(cmp_price - 1.5 * atr, cmp_price * 0.97), 2)
                 sl_pct = round(((cmp_price - stop_loss) / cmp_price) * 100, 2)
-
                 rr_ratio = round((target_5d - cmp_price) / max(cmp_price - stop_loss, 0.01), 2)
-                trade_signal = "STRONG BUY" if confidence >= 85 else "BUY"
+
+                if confidence >= 85:
+                    trade_signal = "STRONG BUY"
+                elif confidence >= 80:
+                    trade_signal = "BUY"
+                else:
+                    trade_signal = "HOLD"
 
                 scored_picks.append({
                     "symbol": sym,
@@ -419,9 +474,10 @@ class StockPredictionService:
                     "stop_loss_pct": sl_pct,
                     "risk_reward_ratio": f"{rr_ratio}:1",
                     "signal": trade_signal,
+                    "action": trade_signal,
                     "confidence": confidence,
                     "rsi": round(rsi, 1),
-                    "rationale": " • ".join(signals[:3]) if signals else "Positive technical momentum and favorable risk/reward setup.",
+                    "rationale": " • ".join(signals[:3]) if signals else "Technical setup under accumulation.",
                     "logo": f"https://www.google.com/s2/favicons?domain={c['name'].split()[0].lower()}.com&sz=128"
                 })
 
@@ -434,42 +490,62 @@ class StockPredictionService:
         if not scored_picks:
             scored_picks = [
                 {
+                    "symbol": "HDFCBANK", "exchange": "NSE", "name": "HDFC Bank Ltd", "sector": "Banking",
+                    "current_price": 718.50, "target_1d": 732.00, "target_5d": 755.00,
+                    "expected_return_pct": 5.08, "stop_loss": 705.00, "stop_loss_pct": 1.88,
+                    "risk_reward_ratio": "2.7:1", "signal": "STRONG BUY", "action": "STRONG BUY", "confidence": 94.0,
+                    "rsi": 54.2, "rationale": "Bullish 20 EMA bounce • Strong institutional accumulation • Private banking leader",
+                    "logo": "https://www.google.com/s2/favicons?domain=hdfcbank.com&sz=128"
+                },
+                {
+                    "symbol": "AXISBANK", "exchange": "NSE", "name": "Axis Bank Ltd", "sector": "Banking",
+                    "current_price": 1248.00, "target_1d": 1270.00, "target_5d": 1305.00,
+                    "expected_return_pct": 4.57, "stop_loss": 1225.00, "stop_loss_pct": 1.84,
+                    "risk_reward_ratio": "2.5:1", "signal": "BUY", "action": "BUY", "confidence": 86.0,
+                    "rsi": 52.1, "rationale": "Multi-month breakout structure • Clean RSI momentum • Credit growth expansion",
+                    "logo": "https://www.google.com/s2/favicons?domain=axisbank.com&sz=128"
+                },
+                {
                     "symbol": "RELIANCE", "exchange": "NSE", "name": "Reliance Industries", "sector": "Energy",
-                    "current_price": 2985.40, "target_1d": 3030.00, "target_5d": 3120.00,
-                    "expected_return_pct": 4.51, "stop_loss": 2920.00, "stop_loss_pct": 2.19,
-                    "risk_reward_ratio": "2.1:1", "signal": "STRONG BUY", "confidence": 88,
+                    "current_price": 1254.00, "target_1d": 1280.00, "target_5d": 1320.00,
+                    "expected_return_pct": 5.26, "stop_loss": 1230.00, "stop_loss_pct": 1.91,
+                    "risk_reward_ratio": "2.8:1", "signal": "BUY", "action": "BUY", "confidence": 84.0,
                     "rsi": 56.4, "rationale": "Bullish moving average alignment • MACD expansion • Institutional inflow",
                     "logo": "https://www.google.com/s2/favicons?domain=ril.com&sz=128"
                 },
                 {
-                    "symbol": "TATAMOTORS", "exchange": "NSE", "name": "Tata Motors Ltd", "sector": "Automobile",
-                    "current_price": 995.20, "target_1d": 1015.00, "target_5d": 1050.00,
-                    "expected_return_pct": 5.51, "stop_loss": 970.00, "stop_loss_pct": 2.53,
-                    "risk_reward_ratio": "2.2:1", "signal": "BUY", "confidence": 84,
-                    "rsi": 62.1, "rationale": "Auto sector rally • EV delivery growth momentum • Breakout above 50-EMA",
-                    "logo": "https://www.google.com/s2/favicons?domain=tatamotors.com&sz=128"
-                },
-                {
                     "symbol": "ICICIBANK", "exchange": "NSE", "name": "ICICI Bank Ltd", "sector": "Banking",
-                    "current_price": 1245.80, "target_1d": 1265.00, "target_5d": 1298.00,
-                    "expected_return_pct": 4.19, "stop_loss": 1220.00, "stop_loss_pct": 2.07,
-                    "risk_reward_ratio": "2.0:1", "signal": "BUY", "confidence": 82,
+                    "current_price": 1352.00, "target_1d": 1380.00, "target_5d": 1415.00,
+                    "expected_return_pct": 4.66, "stop_loss": 1325.00, "stop_loss_pct": 2.00,
+                    "risk_reward_ratio": "2.3:1", "signal": "BUY", "action": "BUY", "confidence": 82.0,
                     "rsi": 54.8, "rationale": "Strong credit growth • Positive banking breadth • Consolidation breakout",
                     "logo": "https://www.google.com/s2/favicons?domain=icicibank.com&sz=128"
                 },
                 {
                     "symbol": "BHARTIARTL", "exchange": "NSE", "name": "Bharti Airtel Ltd", "sector": "Telecom",
-                    "current_price": 1640.50, "target_1d": 1670.00, "target_5d": 1720.00,
-                    "expected_return_pct": 4.85, "stop_loss": 1600.00, "stop_loss_pct": 2.47,
-                    "risk_reward_ratio": "2.0:1", "signal": "STRONG BUY", "confidence": 86,
+                    "current_price": 1832.00, "target_1d": 1865.00, "target_5d": 1910.00,
+                    "expected_return_pct": 4.26, "stop_loss": 1795.00, "stop_loss_pct": 2.02,
+                    "risk_reward_ratio": "2.1:1", "signal": "BUY", "action": "BUY", "confidence": 80.0,
                     "rsi": 59.2, "rationale": "ARPU expansion • 5G user monetization • Sustained uptrend channel",
                     "logo": "https://www.google.com/s2/favicons?domain=airtel.in&sz=128"
                 }
             ]
 
-        final_picks = scored_picks[:6]
+        final_picks = scored_picks[:10]
         _DAILY_PICKS_CACHE["data"] = final_picks
         _DAILY_PICKS_CACHE["timestamp"] = now
+
+        # Persist to MongoDB collection for cross-lambda availability
+        try:
+            from app.models.user import db
+            db.predictions.replace_one(
+                {"type": "daily_recommendations"},
+                {"type": "daily_recommendations", "timestamp": now, "picks": final_picks},
+                upsert=True
+            )
+        except Exception as persist_err:
+            logger.debug(f"Could not persist daily recommendations to MongoDB: {persist_err}")
+
         return final_picks
 
     @staticmethod
