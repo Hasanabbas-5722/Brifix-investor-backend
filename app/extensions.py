@@ -1,3 +1,8 @@
+import sys
+if sys.platform == "darwin":
+    import selectors
+    selectors.DefaultSelector = selectors.SelectSelector
+
 from flask_pymongo import PyMongo
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
@@ -24,39 +29,85 @@ _groww_session = {
 # grow api key = eyJraWQiOiJaTUtjVXciLCJhbGciOiJFUzI1NiJ9.eyJleHAiOjI1NjY5ODk5MDEsImlhdCI6MTc3ODU4OTkwMSwibmJmIjoxNzc4NTg5OTAxLCJzdWIiOiJ7XCJ0b2tlblJlZklkXCI6XCJlZmUwNzBhOC04MDE0LTRjZGItOTdkMC0yM2E5ODVjZmY3OGNcIixcInZlbmRvckludGVncmF0aW9uS2V5XCI6XCJlMzFmZjIzYjA4NmI0MDZjODg3NGIyZjZkODQ5NTMxM1wiLFwidXNlckFjY291bnRJZFwiOlwiMDdhZGU3YjYtMzg5ZS00MTMzLTlkODctMGJiNzBhZmNlZWJhXCIsXCJkZXZpY2VJZFwiOlwiN2E1NWNmNTMtMTBmOS01OTg1LTgyZjItODFmMTlmMWEwOTU1XCIsXCJzZXNzaW9uSWRcIjpcIjIyNzQ0N2UwLTA3NGEtNDEyMi05OGYyLTU0ZTA1ZjQ1YjEwM1wiLFwiYWRkaXRpb25hbERhdGFcIjpcIno1NC9NZzltdjE2WXdmb0gvS0EwYkVXL085NUlhQ3VGSXdRS1J1c01xa0ZSTkczdTlLa2pWZDNoWjU1ZStNZERhWXBOVi9UOUxIRmtQejFFQisybTdRPT1cIixcInJvbGVcIjpcImF1dGgtdG90cFwiLFwic291cmNlSXBBZGRyZXNzXCI6XCIxMDMuMjM4LjE0LjI0NywxNjIuMTU4LjIzNS4xNzcsMzUuMjQxLjIzLjEyM1wiLFwidHdvRmFFeHBpcnlUc1wiOjI1NjY5ODk5MDE1MjAsXCJ2ZW5kb3JOYW1lXCI6XCJncm93d0FwaVwifSIsImlzcyI6ImFwZXgtYXV0aC1wcm9kLWFwcCJ9.y2sYdQv1LadI9Vd3m0aKAkO8kwfha7-qz5q0chzKWnLqCNx1o9bdbWro8NywTklp8DH1XdVwMbSyv-WcjsJY-Q
 # grow secret= 5dnR6E1nv$7EVoBtXN5nM&LazTUJ5Ypa
 
+import threading
+import certifi
+
 mongo = PyMongo()
-client = None
+_mongo_lock = threading.Lock()
+_client_instance = None
+_db_instance = None
 
-def connect_to_mongodb():
-    """Establish a standalone MongoDB connection."""
-    global client
-    mongo_uri = (
-        os.environ.get("MONGO_URI")
-        or os.environ.get("MONGODB_URI")
-        or "mongodb+srv://brifixinvestor:Donsaale5722@brifix-investor.g7snl.mongodb.net/?appName=brifix-investor"
-    )
-    logger.info(f"client ==> {str(client)}")
-    try:
-        if client is not None:
-            logger.info("[OK] MongoDB connection already established")
-            return client
+# Direct replica set URI avoids DNS SRV lookup timeouts on flaky local DNS/IPv6
+DIRECT_REPLICA_SET_URI = (
+    "mongodb://brifixinvestor:Donsaale5722@"
+    "brifix-investor-shard-00-00.g7snl.mongodb.net:27017,"
+    "brifix-investor-shard-00-01.g7snl.mongodb.net:27017,"
+    "brifix-investor-shard-00-02.g7snl.mongodb.net:27017/"
+    "brifix-investor?ssl=true&replicaSet=atlas-r8gczx-shard-0&authSource=admin&retryWrites=true&w=majority"
+)
 
-        client = MongoClient(
-            mongo_uri,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=10000,
-            maxPoolSize=10,
-        )
-        client.admin.command("ping")
-        logger.info("[OK] MongoDB connection established")
+SRV_FALLBACK_URI = "mongodb+srv://brifixinvestor:Donsaale5722@brifix-investor.g7snl.mongodb.net/?appName=brifix-investor"
 
-        client = client["brifix-investor"]
+def connect_to_mongodb(force_reconnect: bool = False):
+    """Establish a robust, thread-safe MongoDB database connection."""
+    global _client_instance, _db_instance
 
-        return client
-    except Exception as e:
-        logger.error(f"[ERROR] Failed to connect to MongoDB: {e}")
+    if not force_reconnect and _db_instance is not None:
+        return _db_instance
+
+    with _mongo_lock:
+        if not force_reconnect and _db_instance is not None:
+            return _db_instance
+
+        # Close old client if force reconnecting
+        if _client_instance is not None:
+            try:
+                _client_instance.close()
+            except Exception:
+                pass
+            _client_instance = None
+            _db_instance = None
+
+        uris_to_try = []
+        custom_uri = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URI")
+        if custom_uri:
+            uris_to_try.append(custom_uri)
+        uris_to_try.extend([DIRECT_REPLICA_SET_URI, SRV_FALLBACK_URI])
+
+        for uri in uris_to_try:
+            try:
+                new_client = MongoClient(
+                    uri,
+                    tlsCAFile=certifi.where(),
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000,
+                    socketTimeoutMS=10000,
+                    maxPoolSize=50,
+                    minPoolSize=5,
+                    maxConnecting=1,
+                    maxIdleTimeMS=45000,
+                    retryWrites=True,
+                    retryReads=True,
+                )
+                # Quick one-time startup topology verification
+                new_client.admin.command("ping")
+                _client_instance = new_client
+                _db_instance = new_client["brifix-investor"]
+                logger.info(f"[OK] MongoDB connection established successfully using {'custom' if uri == custom_uri else ('direct seedlist' if uri == DIRECT_REPLICA_SET_URI else 'SRV')}")
+                return _db_instance
+            except Exception as e:
+                logger.warning(f"Connection attempt to MongoDB with URI failed: {e}")
+                continue
+
+        logger.error("[ERROR] All MongoDB connection attempts failed.")
         return None
+
+def reset_mongodb_connection():
+    """Reset MongoDB connection forcing reconnection on next access."""
+    return connect_to_mongodb(force_reconnect=True)
+
+# Maintain client attribute for backward compatibility
+client = property(lambda self: _db_instance)
 
 def _is_session_expired() -> bool:
     """Session expires at 6 AM IST every day."""

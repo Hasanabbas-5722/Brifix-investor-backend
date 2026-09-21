@@ -14,9 +14,14 @@ logger.info("Initializing SocketIO...")
 is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 
 # Initialize SocketIO with threading on serverless, eventlet for dedicated server
+# ping_timeout=25 and ping_interval=10 provide resilient heartbeat buffering
+# preventing false disconnects on temporary network jitter or Atlas I/O
 socketio = SocketIO(
     cors_allowed_origins="*",
     async_mode='threading' if is_serverless else 'eventlet',
+    ping_timeout=25,
+    ping_interval=10,
+    max_http_buffer_size=10000000,
 )
 
 from app.services.realtime_candle_manager import realtime_candle_manager

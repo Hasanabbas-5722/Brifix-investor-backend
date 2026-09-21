@@ -1,9 +1,14 @@
 import os
 import sys
 
-# On macOS, eventlet's default kqueue hub encounters kevent incompatibilities with Python 3.9+
-# Setting EVENTLET_HUB to 'selects' ensures stable asynchronous I/O
+# On macOS, eventlet's monkey patching does not patch select.kqueue/kevent, which causes
+# Python's KqueueSelector to raise: TypeError: changelist must be an iterable of select.kevent objects
+# during PyMongo socket polling and DNS lookups. Setting DefaultSelector to SelectSelector
+# and EVENTLET_NO_GREENDNS to 'yes' ensures 100% stable networking and zero DNS timeouts.
 if sys.platform == "darwin":
+    import selectors
+    selectors.DefaultSelector = selectors.SelectSelector
+    os.environ["EVENTLET_NO_GREENDNS"] = "yes"
     os.environ.setdefault("EVENTLET_HUB", "selects")
 
 import eventlet

@@ -4,13 +4,14 @@ from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from app.utils.logger import get_logger
 from app.models.user import db
-from app.services.broker_service import get_broker_for_user
+from app.services.broker_service import get_broker_for_user, LiveBrokerError
+from app.utils.market_calendar import check_market_session, get_ist_time, is_market_holiday
 
 logger = get_logger(__name__)
 
-
-def get_ist_time():
-    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+# Concurrency locks to prevent double-order placement on the same symbol for the same user
+_order_locks = set()
+_order_locks_mutex = threading.Lock()
 
 
 class AutoTradeEngine:
@@ -31,6 +32,8 @@ class AutoTradeEngine:
         self.lock = threading.Lock()
         self.running = False
         self.worker_thread = None
+        self._active_symbols = set()
+        self._active_symbols_updated = 0
 
     def start(self):
         """Start background monitoring engine."""
@@ -81,6 +84,12 @@ class AutoTradeEngine:
     def update_user_config(self, user_id: str, updates: dict) -> dict:
         """Update user risk configuration."""
         uid = str(user_id)
+        new_mode = updates.get("tradeMode")
+        if new_mode == "live":
+            user_doc = db.users.find_one({"_id": ObjectId(uid)}) if ObjectId.is_valid(uid) else None
+            # Validate broker can be initialized before saving live configuration
+            get_broker_for_user(user_doc, user_id=uid, trade_mode="live")
+
         sl = float(updates.get("stopLossPct", 1.5))
         rr = float(updates.get("riskRewardRatio", 2.0))
         tp = round(sl * rr, 2)
@@ -102,6 +111,11 @@ class AutoTradeEngine:
     def toggle_engine(self, user_id: str, enable: bool) -> dict:
         """Enable or disable auto-trading master switch for user."""
         uid = str(user_id)
+        cfg = self.get_user_config(uid)
+        if enable and cfg.get("tradeMode") == "live":
+            user_doc = db.users.find_one({"_id": ObjectId(uid)}) if ObjectId.is_valid(uid) else None
+            get_broker_for_user(user_doc, user_id=uid, trade_mode="live")
+
         db.autotrade_configs.update_one(
             {"userId": uid},
             {"$set": {"enabled": bool(enable), "updatedAt": datetime.utcnow()}},
@@ -116,7 +130,18 @@ class AutoTradeEngine:
         if not symbol or ltp <= 0:
             return
 
+        now = time.time()
+        if (now - self._active_symbols_updated) > 2.0:
+            try:
+                self._active_symbols = set(db.autotrade_positions.distinct("symbol", {"status": "OPEN"}))
+                self._active_symbols_updated = now
+            except Exception:
+                pass
+
         clean_sym = symbol.replace(".NS", "").upper()
+        if clean_sym not in self._active_symbols:
+            return
+
         # Find all open positions for this symbol
         open_positions = list(db.autotrade_positions.find({
             "symbol": clean_sym,
@@ -124,6 +149,7 @@ class AutoTradeEngine:
         }))
 
         if not open_positions:
+            self._active_symbols.discard(clean_sym)
             return
 
         for pos in open_positions:
@@ -141,31 +167,43 @@ class AutoTradeEngine:
 
             # 1. Update Trailing Stop Loss if price rises favorably
             new_sl = sl
-            if trailing:
-                gain_pct = ((ltp - entry) / entry) * 100
-                if gain_pct >= 2.0:
-                    # Lock in +1.0% profit
-                    new_sl = max(sl, round(entry * 1.01, 2))
-                elif gain_pct >= 1.0:
-                    # Lock in break-even (+0.2%)
-                    new_sl = max(sl, round(entry * 1.002, 2))
+            if trailing and ltp > entry:
+                profit_margin = ltp - entry
+                sl_distance = entry * (float(cfg.get("stopLossPct", 1.5)) / 100.0)
+                tentative_sl = round(ltp - sl_distance, 2)
+                if tentative_sl > sl:
+                    new_sl = tentative_sl
 
-            # Persist highest and updated trailing SL
-            if highest > pos.get("highestPrice", 0) or new_sl > sl:
-                db.autotrade_positions.update_one(
-                    {"_id": pos_id},
-                    {"$set": {"highestPrice": highest, "stopLossPrice": new_sl}}
-                )
+            # Update DB with latest LTP, highest price & trailing SL
+            db.autotrade_positions.update_one(
+                {"_id": pos_id},
+                {"$set": {
+                    "currentPrice": ltp,
+                    "highestPrice": highest,
+                    "stopLossPrice": new_sl
+                }}
+            )
 
-            # 2. Check Target Hit (Take Profit)
+            # 2. Check Take Profit Hit
             if ltp >= target:
                 self._close_position(pos, ltp, "TARGET_HIT")
                 continue
 
+            # Anti-jitter hysteresis: protect positions for the first 5 seconds after entry
+            entry_time = pos.get("entryTime")
+            if isinstance(entry_time, datetime):
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - entry_time).total_seconds()
+                if age_seconds < 5.0:
+                    continue
+
             # 3. Check Stop Loss Hit (Cut Loss)
             if ltp <= new_sl:
-                reason = "TRAILING_SL_HIT" if new_sl > entry else "STOP_LOSS_HIT"
-                self._close_position(pos, ltp, reason)
+                is_trailing = new_sl > entry
+                reason = "TRAILING_SL_HIT" if is_trailing else "STOP_LOSS_HIT"
+                exit_price = max(ltp, new_sl) if is_trailing else ltp
+                self._close_position(pos, exit_price, reason)
                 continue
 
     def _close_position(self, pos: dict, exit_price: float, reason: str):
@@ -175,12 +213,15 @@ class AutoTradeEngine:
         symbol = pos["symbol"]
         qty = int(pos["quantity"])
         entry = float(pos["entryPrice"])
+        t_mode = pos.get("tradeMode", "paper")
 
         user_doc = db.users.find_one({"_id": ObjectId(user_id)}) if ObjectId.is_valid(user_id) else None
-        broker = get_broker_for_user(user_doc, user_id=str(user_id), trade_mode=pos.get("tradeMode", "paper"))
-
-        # Place SELL order
-        sell_res = broker.place_order(symbol, "SELL", qty, exit_price)
+        try:
+            broker = get_broker_for_user(user_doc, user_id=str(user_id), trade_mode=t_mode)
+            sell_res = broker.place_order(symbol, "SELL", qty, exit_price)
+        except Exception as e:
+            logger.error(f"[AutoTradeEngine] CRITICAL: Failed to execute SELL order for {user_id} {symbol}: {e}")
+            sell_res = {"status": "failed", "error": str(e)}
         realized_pnl = round((exit_price - entry) * qty, 2)
         realized_pct = round(((exit_price - entry) / entry * 100), 2) if entry > 0 else 0
 
@@ -242,14 +283,18 @@ class AutoTradeEngine:
     def _run_loop(self):
         """Background loop scanning high-probability signals and enforcing session rules."""
         import time
+        from app.models.user import _get_db
         while self.running:
             try:
-                # Check intraday square-off (3:15 PM IST)
-                ist_now = get_ist_time()
-                is_square_off_time = (ist_now.hour == 15 and ist_now.minute >= 15) or (ist_now.hour > 15)
+                if _get_db() is None:
+                    time.sleep(2.0)
+                    continue
 
-                if is_square_off_time:
-                    open_intraday = list(db.autotrade_positions.find({"status": "OPEN"}))
+                is_open, status_code, status_msg = check_market_session()
+
+                # Enforce intraday auto square-off at 15:15 IST cutoff for LIVE trading positions
+                if not is_open:
+                    open_intraday = list(db.autotrade_positions.find({"status": "OPEN", "tradeMode": {"$ne": "paper"}}))
                     if open_intraday:
                         from app.socket.indexes import _shared_quotes
                         for pos in open_intraday:
@@ -257,11 +302,16 @@ class AutoTradeEngine:
                             q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
                             ltp = float(q.get("ltp", pos.get("entryPrice", 100.0)))
                             self._close_position(pos, ltp, "INTRADAY_SQUAREOFF")
+                            logger.info(f"[AutoTradeEngine] Live intraday auto square-off executed for {sym} (15:15 IST cutoff).")
 
-                # Scan active enabled users for new high-probability trade opportunities
-                enabled_users = list(db.autotrade_configs.find({"enabled": True}))
-                if enabled_users and not is_square_off_time:
-                    self._scan_and_execute_signals(enabled_users)
+                # Scan active enabled users for new trade opportunities ONLY during open market hours (09:15 - 15:15 IST)
+                if is_open:
+                    enabled_users = list(db.autotrade_configs.find({"enabled": True}))
+                    for u in enabled_users:
+                        try:
+                            self.evaluate_user(u["userId"])
+                        except Exception as e:
+                            logger.error(f"[AutoTradeEngine] User evaluation error for {u.get('userId')}: {e}")
 
             except Exception as e:
                 logger.error(f"[AutoTradeEngine] Error in main loop: {e}")
@@ -279,6 +329,8 @@ class AutoTradeEngine:
         if not cfg.get("enabled", False) and not force_scan:
             return {"status": "disabled", "message": "Automated trading is disabled for this user."}
 
+        trade_mode = cfg.get("tradeMode", "paper")
+
         # 1. Update/check open positions against latest market prices
         open_pos = list(db.autotrade_positions.find({"userId": uid, "status": "OPEN"}))
         from app.socket.indexes import _shared_quotes
@@ -290,7 +342,17 @@ class AutoTradeEngine:
             if ltp > 0:
                 self.on_tick(sym, ltp)
 
-        # 2. Check if we have room for new positions
+        # 2. Market session check - strictly enforce 09:15 - 15:15 IST window for ALL trades (live & paper)
+        is_open, status_code, status_msg = check_market_session()
+        if not is_open:
+            return {
+                "status": "market_closed",
+                "session": status_code,
+                "message": status_msg,
+                "new_positions": []
+            }
+
+        # 3. Check if we have room for new positions
         max_open = int(cfg.get("maxOpenTrades", 3))
         open_count = db.autotrade_positions.count_documents({"userId": uid, "status": "OPEN"})
         if open_count >= max_open:
@@ -300,25 +362,6 @@ class AutoTradeEngine:
                 "max_open": max_open,
                 "message": f"Maximum open positions ({max_open}) already active."
             }
-
-        # 3. Market session check
-        trade_mode = cfg.get("tradeMode", "paper")
-        ist_now = get_ist_time()
-        is_square_off_time = (ist_now.hour == 15 and ist_now.minute >= 15) or (ist_now.hour > 15)
-
-        # Only restrict live exchange execution to market hours (paper simulation is unrestricted)
-        if trade_mode != "paper":
-            is_market_closed = (
-                is_square_off_time or
-                (ist_now.hour < 9) or
-                (ist_now.hour == 9 and ist_now.minute < 15) or
-                (ist_now.weekday() >= 5)
-            )
-            if is_market_closed:
-                return {
-                    "status": "market_closed",
-                    "message": "Live Indian market is closed. Orders can only be placed 09:15 - 15:15 IST on trading days."
-                }
 
         # 4. Fetch AI recommendations for Indian stocks
         try:
@@ -335,9 +378,13 @@ class AutoTradeEngine:
         daily_picks = sorted(daily_picks, key=lambda x: float(x.get("confidence", 0) or 0), reverse=True)
 
         user_doc = db.users.find_one({"_id": ObjectId(uid)}) if ObjectId.is_valid(uid) else None
-        broker = get_broker_for_user(user_doc, user_id=uid, trade_mode=trade_mode)
-        margin = broker.get_margin()
-        avail_cash = float(margin.get("available_cash", 0.0))
+        try:
+            broker = get_broker_for_user(user_doc, user_id=uid, trade_mode=trade_mode)
+            margin = broker.get_margin()
+            avail_cash = float(margin.get("available_cash", 0.0))
+        except LiveBrokerError as e:
+            logger.error(f"[AutoTradeEngine] Live broker error for {uid}: {e}")
+            return {"status": "broker_error", "message": str(e), "new_positions": []}
 
         created_positions = []
         qualified_picks = []
@@ -356,59 +403,83 @@ class AutoTradeEngine:
 
             qualified_picks.append({"symbol": sym, "confidence": conf, "rating": rating})
 
-            # Check if position already exists for this symbol
-            existing = db.autotrade_positions.find_one({"userId": uid, "symbol": sym, "status": "OPEN"})
-            if existing:
-                continue
+            lock_key = f"{uid}:{sym}"
+            with _order_locks_mutex:
+                if lock_key in _order_locks:
+                    continue
+                _order_locks.add(lock_key)
 
-            q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
-            ltp = float(q.get("ltp") or pick.get("current_price") or pick.get("currentPrice") or 0)
-            if ltp <= 0:
-                continue
+            try:
+                # Check if position already exists for this symbol
+                existing = db.autotrade_positions.find_one({"userId": uid, "symbol": sym, "status": "OPEN"})
+                if existing:
+                    continue
 
-            max_alloc = min(float(cfg.get("maxCapitalPerTrade", 10000.0)), avail_cash)
-            qty = int(max_alloc / ltp)
-            if qty <= 0 and avail_cash >= ltp:
-                qty = 1
+                q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
+                ltp = float(q.get("ltp") or pick.get("current_price") or pick.get("currentPrice") or 0)
+                if ltp <= 0:
+                    continue
 
-            if qty <= 0:
-                continue
+                max_alloc = min(float(cfg.get("maxCapitalPerTrade", 10000.0)), avail_cash)
+                qty = int(max_alloc / ltp)
+                if qty <= 0 and avail_cash >= ltp:
+                    qty = 1
 
-            # Calculate Risk-Reward parameters
-            sl_pct = float(cfg.get("stopLossPct", 1.5))
-            rr = float(cfg.get("riskRewardRatio", 2.0))
-            tp_pct = round(sl_pct * rr, 2)
+                if qty <= 0:
+                    continue
 
-            sl_price = round(ltp * (1 - sl_pct / 100), 2)
-            target_price = round(ltp * (1 + tp_pct / 100), 2)
+                order_cost = round(ltp * qty, 2)
+                if trade_mode == "live" and avail_cash < order_cost:
+                    logger.warning(f"[AutoTradeEngine] Insufficient live margin for {uid}: needed Rs.{order_cost}, had Rs.{avail_cash}")
+                    continue
 
-            # Place BUY order through broker
-            buy_res = broker.place_order(sym, "BUY", qty, ltp)
-            if buy_res.get("status") == "success":
-                new_pos = {
-                    "userId": uid,
-                    "symbol": sym,
-                    "quantity": qty,
-                    "entryPrice": ltp,
-                    "stopLossPrice": sl_price,
-                    "targetPrice": target_price,
-                    "highestPrice": ltp,
-                    "status": "OPEN",
-                    "tradeMode": trade_mode,
-                    "aiConfidence": conf,
-                    "entryTime": datetime.utcnow()
-                }
-                res = db.autotrade_positions.insert_one(new_pos)
-                new_pos["id"] = str(res.inserted_id)
-                new_pos.pop("_id", None)
-                created_positions.append(new_pos)
+                # Calculate Risk-Reward parameters
+                sl_pct = float(cfg.get("stopLossPct", 1.5))
+                rr = float(cfg.get("riskRewardRatio", 2.0))
+                tp_pct = round(sl_pct * rr, 2)
 
-                open_count += 1
-                avail_cash -= (ltp * qty)
-                logger.info(
-                    f"[AutoTradeEngine] Executed Auto BUY for {uid}: {qty}x {sym} @ Rs.{ltp} (AI Conf: {conf}%) | "
-                    f"SL: Rs.{sl_price} (-{sl_pct}%) | TP: Rs.{target_price} (+{tp_pct}%)"
-                )
+                sl_price = round(ltp * (1 - sl_pct / 100), 2)
+                target_price = round(ltp * (1 + tp_pct / 100), 2)
+
+                # Place BUY order through broker
+                buy_res = broker.place_order(sym, "BUY", qty, ltp)
+                if buy_res.get("status") == "success":
+                    order_id = buy_res.get("order_id")
+                    # In live mode, verify order status with broker RMS
+                    if trade_mode == "live" and order_id:
+                        v_stat = broker.verify_order_status(order_id)
+                        if v_stat.get("status") in ("REJECTED", "CANCELLED"):
+                            reason = v_stat.get("rejection_reason") or "Order rejected by broker RMS"
+                            logger.error(f"[AutoTradeEngine] Live order {order_id} for {sym} rejected by broker: {reason}")
+                            continue
+
+                    new_pos = {
+                        "userId": uid,
+                        "symbol": sym,
+                        "quantity": qty,
+                        "entryPrice": ltp,
+                        "stopLossPrice": sl_price,
+                        "targetPrice": target_price,
+                        "highestPrice": ltp,
+                        "status": "OPEN",
+                        "tradeMode": trade_mode,
+                        "aiConfidence": conf,
+                        "entryTime": datetime.utcnow()
+                    }
+                    res = db.autotrade_positions.insert_one(new_pos)
+                    new_pos["id"] = str(res.inserted_id)
+                    new_pos.pop("_id", None)
+                    created_positions.append(new_pos)
+
+                    open_count += 1
+                    avail_cash -= order_cost
+                    logger.info(
+                        f"[AutoTradeEngine] Executed Auto BUY for {uid}: {qty}x {sym} @ Rs.{ltp} (AI Conf: {conf}%) | "
+                        f"SL: Rs.{sl_price} (-{sl_pct}%) | TP: Rs.{target_price} (+{tp_pct}%)"
+                    )
+            finally:
+                with _order_locks_mutex:
+                    _order_locks.discard(lock_key)
 
         return {
             "status": "success",

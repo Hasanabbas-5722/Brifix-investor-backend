@@ -62,13 +62,28 @@ def create_app(config_name=None):
     @app.route("/api/v1/market_status", methods=["GET"])
     def market_status():
         try:
-            if nse is None:
-                raise RuntimeError("NSE client not initialized")
-            status = nse.status()
-            return jsonify({"market_status": status})
+            from app.socket.indexes import get_market_session_info
+            session = get_market_session_info()
+            return jsonify({
+                "is_open": session.get("is_open", False),
+                "status": session.get("status", "Closed"),
+                "status_detail": session.get("message", "Market session"),
+                "market_status": [{"market": "Capital Market", "marketStatus": "Open" if session.get("is_open") else "Closed"}],
+                "schedule": {
+                    "open_time": session.get("open_time", "09:15 AM IST"),
+                    "close_time": session.get("close_time", "03:30 PM IST"),
+                    "session": session.get("session", "closed"),
+                    "next_session_label": session.get("message", "Opens at 09:15 AM IST")
+                }
+            })
         except Exception as e:
-            logger.warning(f"Error fetching market status from NSE: {e}")
-            return jsonify({"market_status": [{"market": "Capital Market", "marketStatus": "Closed"}]})
+            logger.warning(f"Error evaluating market status: {e}")
+            return jsonify({
+                "is_open": False,
+                "status": "Closed",
+                "status_detail": "Market closed · Opens at 09:15 AM IST",
+                "market_status": [{"market": "Capital Market", "marketStatus": "Closed"}]
+            })
 
     # Initialize MongoDB
     extensions.connect_to_mongodb()
@@ -83,7 +98,9 @@ def create_app(config_name=None):
     from .routes.watchlist_routes import watchlist_bp
     from .routes.broker_routes import broker_bp
     from .routes.autotrade_routes import autotrade_bp
+    from .routes.fno_routes import fno_bp
     from .services.autotrade_engine import autotrade_engine
+    from .services.fno_autotrade_engine import fno_autotrade_engine
 
     app.register_blueprint(chart_bp)
     app.register_blueprint(watchlist_bp)
@@ -94,8 +111,18 @@ def create_app(config_name=None):
     app.register_blueprint(groww)
     app.register_blueprint(broker_bp)
     app.register_blueprint(autotrade_bp)
+    app.register_blueprint(fno_bp)
 
-    # Start automated trading background engine
+    # Start automated trading background engines
     autotrade_engine.start()
+    fno_autotrade_engine.start()
+
+    # Auto-start real-time 1-second market broadcaster
+    try:
+        from app.socket.indexes import ensure_index_feeder
+        ensure_index_feeder()
+        logger.info("[OK] Real-time market data broadcaster automatically started.")
+    except Exception as feeder_err:
+        logger.warning(f"Could not auto-start index feeder in create_app: {feeder_err}")
 
     return app

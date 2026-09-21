@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 from bson import ObjectId
 from app.utils.logger import get_logger
 from app.utils.access_token_validate import validate_access_token
-from app.models.user import db
+from app.models.user import db, User
 from app.services.broker_service import (
     encrypt_val,
     get_broker_for_user,
@@ -69,6 +69,7 @@ def connect_broker():
                 "angleApiKey": encrypt_val(api_key)
             }
             db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_doc})
+            User.invalidate_cache(user_id)
 
             return jsonify({
                 "status": "success",
@@ -96,6 +97,7 @@ def connect_broker():
                 "growwTotpSecret": encrypt_val(totp)
             }
             db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_doc})
+            User.invalidate_cache(user_id)
 
             return jsonify({
                 "status": "success",
@@ -108,6 +110,7 @@ def connect_broker():
         else:
             # Paper trading sandbox
             db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"activeBroker": "paper"}})
+            User.invalidate_cache(user_id)
             paper = PaperTradingBroker(user_id)
             return jsonify({
                 "status": "success",
@@ -152,6 +155,7 @@ def disconnect_broker():
 
     user_id = str(user_doc.get("_id") or user_doc.get("id"))
     db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"activeBroker": "paper"}})
+    User.invalidate_cache(user_id)
 
     paper = PaperTradingBroker(user_id)
     return jsonify({

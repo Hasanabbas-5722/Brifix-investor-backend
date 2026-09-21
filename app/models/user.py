@@ -1,6 +1,10 @@
 """Example MongoDB models for Users collection"""
 from datetime import datetime
+import time
+import copy
+import threading
 from bson import ObjectId
+from pymongo.errors import PyMongoError
 from app.extensions import connect_to_mongodb
 from app.utils.logger import get_logger
 
@@ -9,14 +13,38 @@ logger = get_logger(__name__)
 
 COLLECTION_NAME = "users"
 
+# In-memory user cache to eliminate DB load on rapid page refreshes
+_USER_CACHE_TTL = 30.0
+_user_cache = {}  # {user_id_str: (user_dict_copy, expire_time)}
+_cache_lock = threading.Lock()
 
-db = connect_to_mongodb()
+
+class _DatabaseProxy:
+    """Dynamic proxy that always delegates to the live MongoDB database connection."""
+    def _target(self):
+        return connect_to_mongodb()
+
+    def __getattr__(self, name):
+        target = self._target()
+        if target is None:
+            raise RuntimeError(f"MongoDB connection is not established when accessing '{name}'")
+        return getattr(target, name)
+
+    def __getitem__(self, name):
+        target = self._target()
+        if target is None:
+            raise RuntimeError(f"MongoDB connection is not established when accessing collection '{name}'")
+        return target[name]
+
+    def __bool__(self):
+        return self._target() is not None
+
+
+db = _DatabaseProxy()
+
 
 def _get_db():
-    global db
-    if db is None:
-        db = connect_to_mongodb()
-    return db
+    return connect_to_mongodb()
 
 class User:
     """User model for MongoDB"""
@@ -44,18 +72,24 @@ class User:
 
     @staticmethod
     def find_by_email(email):
-        """Find user by email"""
+        """Find user by email with retry resilience"""
         logger.info(f"email : {email}")
-        database = _get_db()
-        if database is None:
-            logger.error("Database connection is None in find_by_email")
-            return None
-        user_data = database.users.find_one({"email": email})
-        logger.info(f"user data :::: {user_data}")
-        if not user_data:
-            return None
-        user_data["id"] = str(user_data["_id"])
-        return user_data
+        for attempt in range(3):
+            try:
+                database = _get_db()
+                if database is None:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                user_data = database.users.find_one({"email": email})
+                if not user_data:
+                    return None
+                user_data["_id"] = str(user_data["_id"])
+                user_data["id"] = str(user_data["_id"])
+                return user_data
+            except Exception as e:
+                logger.warning(f"Transient error finding user by email {email} (attempt {attempt + 1}/3): {e}")
+                time.sleep(0.15 * (attempt + 1))
+        return None
 
     @staticmethod
     def create_user(name, email, password_hash, phone=None):
@@ -79,8 +113,17 @@ class User:
             logger.error(f"Error creating user: {e}")
             return None
 
-    @staticmethod
-    def update_token(id, jwt_token):
+    @classmethod
+    def invalidate_cache(cls, user_id=None):
+        """Invalidate user in-memory cache."""
+        with _cache_lock:
+            if user_id:
+                _user_cache.pop(str(user_id), None)
+            else:
+                _user_cache.clear()
+
+    @classmethod
+    def update_token(cls, id, jwt_token):
         """Update user accessToken only"""
         try:
             result = _get_db().users.update_one(
@@ -90,13 +133,14 @@ class User:
                     "updatedAt": datetime.utcnow()
                 }}
             )
+            cls.invalidate_cache(id)
             return result.modified_count > 0
         except Exception as e:
             logger.error(f"Error updating user token: {e}")
             return False
 
-    @staticmethod
-    def update(angle_jwt_token, angle_refresh_token, angle_feed_token, id, jwt_token):
+    @classmethod
+    def update(cls, angle_jwt_token, angle_refresh_token, angle_feed_token, id, jwt_token):
         """Update user"""
         try:
             result = _get_db().users.update_one(
@@ -109,28 +153,70 @@ class User:
                     "accessToken": jwt_token
                 }}
             )
+            cls.invalidate_cache(id)
             return result.modified_count > 0
         except Exception as e:
             logger.error(f"Error updating user: {e}")
             return False
 
-    @staticmethod
-    def find_user_by_user_id(id):
-        """Find user by id"""
-        try:
-            logger.info(f"id : {id}")
-            user_data = _get_db().users.find_one({"_id": ObjectId(id)})
-            if not user_data:
-                return None
-            user_data["_id"] = str(user_data["_id"])
-            user_data["id"] = str(user_data["_id"])
-            return user_data
-        except Exception as e:
-            logger.error(f"Error finding user by id: {e}")
+    @classmethod
+    def find_user_by_user_id(cls, id):
+        """Find user by id with in-memory caching and resilient retries."""
+        if not id:
             return None
+
+        user_id_str = str(id)
+        now = time.time()
+
+        # 1. Fast RAM path: Return cached user object to eliminate DB load on parallel page refreshes
+        with _cache_lock:
+            cached = _user_cache.get(user_id_str)
+            if cached:
+                cached_data, exp = cached
+                if now < exp:
+                    return copy.deepcopy(cached_data)
+                else:
+                    _user_cache.pop(user_id_str, None)
+
+        # 2. Database path with retry resilience against momentary network/SSL glitches
+        last_exception = None
+        for attempt in range(3):
+            try:
+                database = _get_db()
+                if database is None:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+
+                user_data = database.users.find_one({"_id": ObjectId(user_id_str)})
+                if not user_data:
+                    return None
+
+                user_data["_id"] = str(user_data["_id"])
+                user_data["id"] = str(user_data["_id"])
+
+                # Store snapshot in RAM cache
+                with _cache_lock:
+                    _user_cache[user_id_str] = (copy.deepcopy(user_data), now + _USER_CACHE_TTL)
+
+                return user_data
+
+            except PyMongoError as pe:
+                last_exception = pe
+                logger.warning(f"Transient PyMongo error querying user {user_id_str} (attempt {attempt + 1}/3): {pe}")
+                time.sleep(0.15 * (attempt + 1))
+            except Exception as e:
+                last_exception = e
+                logger.error(f"Error finding user by id {user_id_str}: {e}")
+                break
+
+        if last_exception:
+            logger.error(f"Failed to query user {user_id_str} after 3 retries: {last_exception}")
+            raise RuntimeError(f"Database connection error: {last_exception}")
+
+        return None
     
-    @staticmethod
-    def update_password(email, new_password):
+    @classmethod
+    def update_password(cls, email, new_password):
         """Update user password"""
         try:
             result = _get_db().users.update_one(
@@ -140,6 +226,7 @@ class User:
                     "updatedAt": datetime.utcnow()
                 }}
             )
+            cls.invalidate_cache()
             return result.modified_count > 0
         except Exception as e:
             logger.error(f"Error updating password: {e}")

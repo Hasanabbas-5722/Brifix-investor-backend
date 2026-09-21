@@ -42,6 +42,11 @@ def decrypt_val(cipher_text: str) -> str:
         return cipher_text
 
 
+class LiveBrokerError(Exception):
+    """Raised when live broker operation, authentication, or validation fails in real-money live mode."""
+    pass
+
+
 _ACTIVE_ANGEL_SESSIONS = {}
 _ACTIVE_GROWW_SESSIONS = {}
 
@@ -58,10 +63,16 @@ class BaseBroker:
     def place_order(self, symbol: str, transaction_type: str, quantity: int, price: float = 0, order_type: str = "MARKET") -> dict:
         raise NotImplementedError
 
+    def place_fno_order(self, symbol: str, option_type: str, strike: float, transaction_type: str, quantity: int, price: float = 0, order_type: str = "MARKET") -> dict:
+        raise NotImplementedError
+
     def get_orders(self) -> list:
         raise NotImplementedError
 
     def get_positions(self) -> list:
+        raise NotImplementedError
+
+    def verify_order_status(self, order_id: str) -> dict:
         raise NotImplementedError
 
 
@@ -156,6 +167,56 @@ class PaperTradingBroker(BaseBroker):
             "message": f"Paper order executed for {quantity}x {clean_sym} @ Rs.{fill_price}"
         }
 
+    def place_fno_order(self, symbol: str, option_type: str, strike: float, transaction_type: str, quantity: int, price: float = 0, order_type: str = "MARKET") -> dict:
+        fno_symbol = f"{symbol.upper()} {int(strike)} {option_type.upper()}"
+        fill_price = max(float(price), 1.0)
+        order_val = round(fill_price * quantity, 2)
+        acc = db.paper_accounts.find_one({"userId": self.user_id}) or {}
+        cash = float(acc.get("availableCash", 1000000.0))
+
+        if transaction_type.upper() == "BUY":
+            if cash < order_val:
+                return {"status": "failed", "error": f"Insufficient paper margin: Required ₹{order_val}, Available ₹{cash}"}
+            db.paper_accounts.update_one(
+                {"userId": self.user_id},
+                {"$inc": {"availableCash": -order_val, "usedMargin": order_val}, "$set": {"updatedAt": datetime.utcnow()}}
+            )
+        elif transaction_type.upper() == "SELL":
+            db.paper_accounts.update_one(
+                {"userId": self.user_id},
+                {"$inc": {"availableCash": order_val, "usedMargin": -min(order_val, float(acc.get("usedMargin", order_val)))}, "$set": {"updatedAt": datetime.utcnow()}}
+            )
+
+        order_doc = {
+            "userId": self.user_id,
+            "broker": "paper",
+            "orderId": f"PAPER-FNO-{int(time.time()*1000)}",
+            "symbol": fno_symbol,
+            "underlying": symbol.upper(),
+            "optionType": option_type.upper(),
+            "strike": strike,
+            "segment": "FNO",
+            "transactionType": transaction_type.upper(),
+            "quantity": quantity,
+            "price": fill_price,
+            "orderValue": order_val,
+            "orderType": order_type,
+            "status": "COMPLETE",
+            "timestamp": datetime.utcnow()
+        }
+        db.paper_orders.insert_one(order_doc)
+        logger.info(f"[PaperBroker] Executed F&O {transaction_type} {quantity}x {fno_symbol} @ Rs.{fill_price}")
+
+        return {
+            "status": "success",
+            "order_id": order_doc["orderId"],
+            "symbol": fno_symbol,
+            "fill_price": fill_price,
+            "quantity": quantity,
+            "order_value": order_val,
+            "message": f"Paper F&O order executed: {quantity}x {fno_symbol} @ Rs.{fill_price}"
+        }
+
     def get_orders(self) -> list:
         docs = list(db.paper_orders.find({"userId": self.user_id}).sort("timestamp", -1).limit(50))
         for d in docs:
@@ -198,6 +259,9 @@ class PaperTradingBroker(BaseBroker):
                     "pnl_pct": round(pnl_pct, 2)
                 })
         return positions
+
+    def verify_order_status(self, order_id: str) -> dict:
+        return {"status": "FILLED", "rejection_reason": "", "filled_qty": 0, "avg_price": 0.0}
 
 
 class AngelOneBroker(BaseBroker):
@@ -286,7 +350,11 @@ class AngelOneBroker(BaseBroker):
         clean_sym = symbol.replace(".NS", "").upper()
         token_id, _ = resolve_symbol_to_token(clean_sym)
         if not token_id:
-            token_id = "3045"
+            logger.error(f"[AngelOneBroker] Token resolution failed for {clean_sym}. Trade rejected for capital safety.")
+            return {
+                "status": "failed",
+                "error": f"Scrip token resolution failed for symbol '{clean_sym}'. Live trade rejected for capital safety."
+            }
 
         params = {
             "variety": "NORMAL",
@@ -305,7 +373,7 @@ class AngelOneBroker(BaseBroker):
         try:
             res = self.smart_connect.placeOrder(params)
             order_id = res.get("data", {}).get("orderid") if isinstance(res, dict) else str(res)
-            logger.info(f"[AngelOneBroker] Placed order: {order_id}")
+            logger.info(f"[AngelOneBroker] Placed order: {order_id} for {clean_sym}-EQ (Token: {token_id})")
             return {
                 "status": "success",
                 "order_id": order_id,
@@ -316,6 +384,45 @@ class AngelOneBroker(BaseBroker):
             }
         except Exception as e:
             logger.error(f"[AngelOneBroker] Order placement failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+    def place_fno_order(self, symbol: str, option_type: str, strike: float, transaction_type: str, quantity: int, price: float = 0, order_type: str = "MARKET") -> dict:
+        from app.socket.indexes import resolve_fno_token
+        tradingsymbol, symbol_token, lot_size = resolve_fno_token(symbol, option_type, strike)
+        if not tradingsymbol or not symbol_token:
+            clean_sym = symbol.upper().replace(" ", "")
+            tradingsymbol = f"{clean_sym}{int(strike)}{option_type.upper()}"
+            symbol_token = "0"
+            logger.warning(f"[AngelOneBroker] Exact NFO token not in cache for {symbol} {strike} {option_type}, using: {tradingsymbol}")
+
+        params = {
+            "variety": "NORMAL",
+            "tradingsymbol": tradingsymbol,
+            "symboltoken": str(symbol_token),
+            "transactiontype": transaction_type.upper(),
+            "exchange": "NFO",
+            "ordertype": "MARKET" if order_type == "MARKET" else "LIMIT",
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": str(price) if order_type != "MARKET" else "0",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(quantity)
+        }
+        try:
+            res = self.smart_connect.placeOrder(params)
+            order_id = res.get("data", {}).get("orderid") if isinstance(res, dict) else str(res)
+            logger.info(f"[AngelOneBroker] Placed F&O order: {order_id} ({tradingsymbol}, Token: {symbol_token})")
+            return {
+                "status": "success",
+                "order_id": order_id,
+                "symbol": tradingsymbol,
+                "quantity": quantity,
+                "transaction_type": transaction_type.upper(),
+                "message": f"F&O Order submitted to Angel One: {order_id}"
+            }
+        except Exception as e:
+            logger.error(f"[AngelOneBroker] F&O order failed: {e}")
             return {"status": "failed", "error": str(e)}
 
     def get_orders(self) -> list:
@@ -335,6 +442,29 @@ class AngelOneBroker(BaseBroker):
         except Exception as e:
             logger.warning(f"Error getting Angel One positions: {e}")
             return []
+
+    def verify_order_status(self, order_id: str) -> dict:
+        """Verify status of order placed with Angel One RMS."""
+        try:
+            orders = self.get_orders()
+            for o in orders:
+                if str(o.get("orderid")) == str(order_id):
+                    st = str(o.get("status", "")).lower()
+                    reason = o.get("text") or o.get("rejectionreason") or ""
+                    filled_qty = int(o.get("filledshares", 0) or 0)
+                    avg_price = float(o.get("averageprice", 0.0) or 0.0)
+                    if "complete" in st or "filled" in st:
+                        return {"status": "FILLED", "rejection_reason": "", "filled_qty": filled_qty, "avg_price": avg_price}
+                    elif "reject" in st:
+                        return {"status": "REJECTED", "rejection_reason": reason, "filled_qty": 0, "avg_price": 0.0}
+                    elif "cancel" in st:
+                        return {"status": "CANCELLED", "rejection_reason": reason, "filled_qty": 0, "avg_price": 0.0}
+                    else:
+                        return {"status": "OPEN", "rejection_reason": "", "filled_qty": filled_qty, "avg_price": avg_price}
+            return {"status": "SUBMITTED", "rejection_reason": "", "filled_qty": 0, "avg_price": 0.0}
+        except Exception as e:
+            logger.warning(f"Error verifying Angel One order {order_id}: {e}")
+            return {"status": "UNKNOWN", "rejection_reason": str(e), "filled_qty": 0, "avg_price": 0.0}
 
 
 class GrowwBroker(BaseBroker):
@@ -416,6 +546,26 @@ class GrowwBroker(BaseBroker):
             logger.error(f"[GrowwBroker] Order failed: {e}")
             return {"status": "failed", "error": str(e)}
 
+    def place_fno_order(self, symbol: str, option_type: str, strike: float, transaction_type: str, quantity: int, price: float = 0, order_type: str = "MARKET") -> dict:
+        clean_sym = symbol.upper()
+        fno_symbol = f"{clean_sym} {int(strike)} {option_type.upper()}"
+        try:
+            res = self.client.place_order(
+                exchange="NSE",
+                segment="FNO",
+                trading_symbol=fno_symbol.replace(" ", ""),
+                order_type="MARKET" if order_type == "MARKET" else "LIMIT",
+                transaction_type=transaction_type.upper(),
+                product="MIS",
+                quantity=quantity,
+                price=price if order_type != "MARKET" else 0
+            )
+            order_id = res.get("order_id") or str(res)
+            return {"status": "success", "order_id": order_id, "symbol": fno_symbol, "quantity": quantity}
+        except Exception as e:
+            logger.error(f"[GrowwBroker] F&O order failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
     def get_orders(self) -> list:
         try:
             return self.client.get_order_list() or []
@@ -428,26 +578,105 @@ class GrowwBroker(BaseBroker):
         except Exception:
             return []
 
+    def verify_order_status(self, order_id: str) -> dict:
+        """Verify status of order placed with Groww."""
+        try:
+            orders = self.get_orders()
+            for o in orders:
+                if str(o.get("order_id") or o.get("orderId")) == str(order_id):
+                    st = str(o.get("order_status") or o.get("status", "")).lower()
+                    reason = o.get("rejection_reason") or o.get("remarks") or ""
+                    filled_qty = int(o.get("filled_quantity", 0) or 0)
+                    avg_price = float(o.get("average_price", 0.0) or 0.0)
+                    if "complete" in st or "filled" in st or "executed" in st:
+                        return {"status": "FILLED", "rejection_reason": "", "filled_qty": filled_qty, "avg_price": avg_price}
+                    elif "reject" in st:
+                        return {"status": "REJECTED", "rejection_reason": reason, "filled_qty": 0, "avg_price": avg_price}
+                    elif "cancel" in st:
+                        return {"status": "CANCELLED", "rejection_reason": reason, "filled_qty": 0, "avg_price": avg_price}
+                    else:
+                        return {"status": "OPEN", "rejection_reason": "", "filled_qty": filled_qty, "avg_price": avg_price}
+            return {"status": "SUBMITTED", "rejection_reason": "", "filled_qty": 0, "avg_price": 0.0}
+        except Exception as e:
+            logger.warning(f"Error verifying Groww order {order_id}: {e}")
+            return {"status": "UNKNOWN", "rejection_reason": str(e), "filled_qty": 0, "avg_price": 0.0}
+
 
 def get_broker_for_user(user_doc: dict = None, user_id: str = None, trade_mode: str = None) -> BaseBroker:
-    """Instantiate appropriate broker instance based on user's saved credentials and configuration."""
+    """
+    Instantiate appropriate broker instance based on user's saved credentials and configuration.
+    Strict Fail-Closed: If trade_mode is 'live', NEVER silently falls back to Paper.
+    Raises LiveBrokerError if credentials are missing or broker authentication fails.
+    """
     uid = str(user_id or (user_doc.get("_id") if user_doc else None) or (user_doc.get("id") if user_doc else None) or "demo")
 
-    # If explicitly in paper mode or trade_mode is paper, always return PaperTradingBroker
+    # If explicitly in paper mode, always return PaperTradingBroker
     if trade_mode == "paper":
         return PaperTradingBroker(uid)
 
+    # If in live mode, enforce strict authentication and zero fallback
+    if trade_mode == "live":
+        if not user_doc:
+            from bson import ObjectId
+            if ObjectId.is_valid(uid):
+                user_doc = db.users.find_one({"_id": ObjectId(uid)})
+
+        if not user_doc:
+            raise LiveBrokerError(f"User account '{uid}' not found for live trading.")
+
+        active_broker = user_doc.get("activeBroker", "").lower()
+        if active_broker not in ("angelone", "groww"):
+            raise LiveBrokerError(
+                f"No active live broker configured for user {uid}. "
+                "Please connect Angel One or Groww with valid API credentials in Broker Settings before activating Live mode."
+            )
+
+        if active_broker == "angelone":
+            code = user_doc.get("angleClientCode")
+            pin = decrypt_val(user_doc.get("angleClientPin", ""))
+            totp = decrypt_val(user_doc.get("angleTotpSecret", ""))
+            api_key = decrypt_val(user_doc.get("angleApiKey", ""))
+
+            if not (code and pin and totp and api_key):
+                raise LiveBrokerError(
+                    f"Incomplete Angel One credentials for user {uid}. "
+                    "Client Code, MPIN, TOTP Secret, and API Key are all required for live execution."
+                )
+
+            try:
+                return AngelOneBroker(code, pin, totp, api_key)
+            except Exception as e:
+                logger.error(f"[AngelOneBroker] Live authentication failed for user {uid}: {e}")
+                raise LiveBrokerError(f"Angel One live broker connection failed: {e}")
+
+        elif active_broker == "groww":
+            api_key = decrypt_val(user_doc.get("growwApiKey", ""))
+            totp = decrypt_val(user_doc.get("growwTotpSecret", ""))
+
+            if not (api_key and totp):
+                raise LiveBrokerError(
+                    f"Incomplete Groww credentials for user {uid}. "
+                    "API Key and TOTP Secret are required for live execution."
+                )
+
+            try:
+                return GrowwBroker(api_key, totp)
+            except Exception as e:
+                logger.error(f"[GrowwBroker] Live authentication failed for user {uid}: {e}")
+                raise LiveBrokerError(f"Groww live broker connection failed: {e}")
+
+        raise LiveBrokerError(f"Unsupported active broker '{active_broker}' for live trading.")
+
+    # Unspecified trade_mode (backward compatibility fallback)
     if not user_doc:
         return PaperTradingBroker(uid)
 
     active_broker = user_doc.get("activeBroker", "paper").lower()
-
     if active_broker == "angelone":
         code = user_doc.get("angleClientCode")
         pin = decrypt_val(user_doc.get("angleClientPin", ""))
         totp = decrypt_val(user_doc.get("angleTotpSecret", ""))
         api_key = decrypt_val(user_doc.get("angleApiKey", ""))
-
         if code and pin and totp and api_key:
             try:
                 return AngelOneBroker(code, pin, totp, api_key)
@@ -457,7 +686,6 @@ def get_broker_for_user(user_doc: dict = None, user_id: str = None, trade_mode: 
     elif active_broker == "groww":
         api_key = decrypt_val(user_doc.get("growwApiKey", ""))
         totp = decrypt_val(user_doc.get("growwTotpSecret", ""))
-
         if api_key and totp:
             try:
                 return GrowwBroker(api_key, totp)

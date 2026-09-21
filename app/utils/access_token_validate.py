@@ -51,7 +51,12 @@ def validate_access_token(func):
             if not user_id:
                 return jsonify({"status": "failed", "message": "Invalid token payload"}), 401
 
-            user_data = User.find_user_by_user_id(user_id)
+            try:
+                user_data = User.find_user_by_user_id(user_id)
+            except Exception as dbe:
+                logger.error(f"Database error during token validation for user {user_id}: {dbe}")
+                return jsonify({"status": "failed", "message": "Database temporarily busy, please retry"}), 503
+
             if not user_data:
                 return jsonify({"status": "failed", "message": "User not found"}), 401
 
@@ -62,8 +67,12 @@ def validate_access_token(func):
             logger.warning("Token expired")
             return jsonify({"status": "failed", "message": "Token expired"}), 401
 
-        except Exception as e:
-            logger.warning(f"Token validation error: {e}")
+        except jwt.InvalidTokenError as ite:
+            logger.warning(f"Invalid token: {ite}")
             return jsonify({"status": "failed", "message": "Invalid token"}), 401
+
+        except Exception as e:
+            logger.error(f"Token validation error: {e}")
+            return jsonify({"status": "failed", "message": "Authentication service error"}), 500
 
     return wrapper

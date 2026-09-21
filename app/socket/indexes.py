@@ -42,6 +42,29 @@ _feeder_lock = threading.Lock()
 _dynamic_symbols = set()
 _dynamic_lock = threading.Lock()
 
+import queue
+_tick_eval_queue = queue.Queue(maxsize=300)
+_tick_eval_worker_started = False
+
+def _tick_eval_worker():
+    """Background worker processing autotrade position checks without blocking broadcaster."""
+    while True:
+        try:
+            item = _tick_eval_queue.get(timeout=2.0)
+            if item is None:
+                break
+            is_index, sym, ltp = item
+            from app.services.autotrade_engine import autotrade_engine
+            from app.services.fno_autotrade_engine import fno_autotrade_engine
+            if is_index:
+                fno_autotrade_engine.on_index_tick(sym, ltp)
+            else:
+                autotrade_engine.on_tick(sym, ltp)
+        except queue.Empty:
+            continue
+        except Exception:
+            pass
+
 def register_dynamic_symbol(sym):
     """Dynamically add symbol to live streaming feed."""
     if not sym:
@@ -76,25 +99,84 @@ CORE_STOCKS = [
     ("KOTAKBANK.NS", "KOTAKBANK", "Kotak Mahindra Bank"),
 ]
 
+def get_market_session_info() -> dict:
+    """Returns official Indian NSE market session status, trading window, and schedule."""
+    try:
+        from app.utils.market_calendar import get_ist_time, is_market_holiday
+        ist_now = get_ist_time()
+
+        # 1. Holiday check
+        is_holiday, holiday_name = is_market_holiday(ist_now)
+        if is_holiday:
+            return {
+                "is_open": False,
+                "status": "CLOSED",
+                "session": "holiday",
+                "message": f"NSE Market closed today for {holiday_name}.",
+                "open_time": "09:15 AM IST",
+                "close_time": "03:30 PM IST"
+            }
+
+        # 2. Weekend check
+        if ist_now.weekday() >= 5:
+            return {
+                "is_open": False,
+                "status": "CLOSED",
+                "session": "weekend",
+                "message": "NSE Market closed for weekend. Next session opens Monday at 09:15 AM IST.",
+                "open_time": "09:15 AM IST",
+                "close_time": "03:30 PM IST"
+            }
+
+        # 3. Time of day check (09:15 AM - 03:30 PM IST)
+        mins = ist_now.hour * 60 + ist_now.minute
+        if mins < 555:  # Before 09:15 AM
+            return {
+                "is_open": False,
+                "status": "CLOSED",
+                "session": "pre_market",
+                "message": "NSE Market is closed. Trading session opens at 09:15 AM IST.",
+                "open_time": "09:15 AM IST",
+                "close_time": "03:30 PM IST"
+            }
+        elif mins > 930:  # After 03:30 PM
+            return {
+                "is_open": False,
+                "status": "CLOSED",
+                "session": "post_market",
+                "message": "NSE Market closed (Session ended at 03:30 PM IST). Reopens tomorrow at 09:15 AM IST.",
+                "open_time": "09:15 AM IST",
+                "close_time": "03:30 PM IST"
+            }
+        else:
+            is_cutoff = mins >= 915  # 15:15 IST intraday cutoff
+            return {
+                "is_open": True,
+                "status": "OPEN",
+                "session": "intraday_cutoff" if is_cutoff else "open",
+                "message": "Intraday square-off window active (15:15 IST cutoff)." if is_cutoff else "NSE Market is open (09:15 - 15:30 IST).",
+                "open_time": "09:15 AM IST",
+                "close_time": "03:30 PM IST"
+            }
+    except Exception as e:
+        return {
+            "is_open": False,
+            "status": "CLOSED",
+            "session": "unknown",
+            "message": f"Market status check: {e}",
+            "open_time": "09:15 AM IST",
+            "close_time": "03:30 PM IST"
+        }
+
 def is_nse_market_open() -> bool:
     """Check if Indian NSE market is currently in normal trading session (09:15 - 15:30 IST, Mon-Fri)."""
-    try:
-        from datetime import datetime, timezone, timedelta
-        now_utc = datetime.now(timezone.utc)
-        ist_now = now_utc + timedelta(hours=5, minutes=30)
-        if ist_now.weekday() >= 5:
-            return False
-        market_open = ist_now.replace(hour=9, minute=15, second=0, microsecond=0)
-        market_close = ist_now.replace(hour=15, minute=30, second=0, microsecond=0)
-        return market_open <= ist_now <= market_close
-    except Exception:
-        return False
+    return bool(get_market_session_info().get("is_open", False))
 
 DEFAULT_SEED_QUOTES = {
-    "^NSEI": {'ltp': 23200.00, 'prev': 23118.60, 'open': 23150.00, 'high': 23250.00, 'low': 23100.00, 'vol': 550000},
-    "^NSEBANK": {'ltp': 55990.00, 'prev': 55794.75, 'open': 55800.00, 'high': 56150.00, 'low': 55700.00, 'vol': 380000},
+    "^NSEI": {'ltp': 23320.30, 'prev': 23118.60, 'open': 23150.00, 'high': 23350.00, 'low': 23100.00, 'vol': 550000},
+    "^NSEBANK": {'ltp': 56205.10, 'prev': 55794.75, 'open': 55800.00, 'high': 56250.00, 'low': 55700.00, 'vol': 380000},
     "^BSESN": {'ltp': 74360.00, 'prev': 74003.80, 'open': 74100.00, 'high': 74550.00, 'low': 73950.00, 'vol': 250000},
-    "NIFTY_FIN_SERVICE.NS": {'ltp': 25120.00, 'prev': 25076.65, 'open': 25080.00, 'high': 25200.00, 'low': 25020.00, 'vol': 180000},
+    "NIFTY_FIN_SERVICE.NS": {'ltp': 25419.90, 'prev': 25076.65, 'open': 25080.00, 'high': 25450.00, 'low': 25020.00, 'vol': 180000},
     "RELIANCE.NS": {'ltp': 1251.00, 'prev': 1235.30, 'open': 1240.00, 'high': 1260.00, 'low': 1230.00, 'vol': 150000},
     "TCS.NS": {'ltp': 2236.00, 'prev': 2251.00, 'open': 2245.00, 'high': 2265.00, 'low': 2225.00, 'vol': 110000},
     "HDFCBANK.NS": {'ltp': 716.30, 'prev': 716.55, 'open': 717.00, 'high': 722.00, 'low': 714.00, 'vol': 280000},
@@ -164,9 +246,17 @@ def _run_index_feeder():
     logger.info("Starting ultra-responsive real-time market broadcaster...")
 
     try:
+        status_emit_counter = 0
         while _fallback_feeder_running:
             try:
-                is_market_open = is_nse_market_open()
+                session_info = get_market_session_info()
+                is_market_open = session_info.get("is_open", False)
+
+                # Periodic market status broadcast (every ~5s)
+                status_emit_counter += 1
+                if status_emit_counter >= 5:
+                    status_emit_counter = 0
+                    socketio.emit("market_status", session_info, room='indexes')
 
                 # Build target list
                 stock_list = list(CORE_STOCKS)
@@ -194,16 +284,18 @@ def _run_index_feeder():
                     day_h = q['high']
                     day_l = q['low']
 
-                    # Continuous micro-tick drift for 24/7 responsiveness
-                    jitter = (random.random() - 0.5) * 0.0003 * ltp
-                    ltp = round(ltp + jitter, 2)
-                    day_h = max(day_h, ltp)
-                    day_l = min(day_l, ltp)
+                    # CRITICAL: Prices ONLY jitter during OPEN market session (09:15 - 15:30 IST)
+                    # When market is CLOSED, prices are 100% frozen at the official closing price!
+                    if is_market_open:
+                        jitter = (random.random() - 0.5) * 0.0003 * ltp
+                        ltp = round(ltp + jitter, 2)
+                        day_h = max(day_h, ltp)
+                        day_l = min(day_l, ltp)
 
-                    # Update shared quote with new tick
-                    q['ltp'] = ltp
-                    q['high'] = day_h
-                    q['low'] = day_l
+                        # Update shared quote with new tick
+                        q['ltp'] = ltp
+                        q['high'] = day_h
+                        q['low'] = day_l
 
                     change = round(ltp - prev, 2)
                     p_change = round((change / prev * 100), 2) if prev > 0 else 0.0
@@ -215,6 +307,8 @@ def _run_index_feeder():
                         "ltp": round(ltp, 2),
                         "change": change,
                         "pChange": p_change,
+                        "is_market_open": is_market_open,
+                        "market_status": session_info.get("status", "CLOSED"),
                         "full_data": {
                             "last_traded_price": round(ltp * 100),
                             "closed_price": round(prev * 100),
@@ -227,10 +321,8 @@ def _run_index_feeder():
                     # Broadcast index updates to room 'indexes'
                     if is_index:
                         socketio.emit("indexes_data", tick_payload, room='indexes')
-                        # Broadcast to chart rooms (token, display_name, ticker_sym)
-                        socketio.emit("indexes_data", tick_payload, room=f"chart_{token_id}_1d")
-                        socketio.emit("indexes_data", tick_payload, room=f"chart_{display_name}_1d")
-                        socketio.emit("indexes_data", tick_payload, room=f"chart_{ticker_sym}_1d")
+                        if _chart_symbol_clients.get(token_id):
+                            socketio.emit("indexes_data", tick_payload, room=f"chart_{token_id}_1d")
                     else:
                         socketio.emit("stock_price", tick_payload, room='indexes')
                         stock_movers.append({
@@ -238,28 +330,24 @@ def _run_index_feeder():
                             "companyName": display_name,
                             "ltp": round(ltp, 2),
                             "change": change,
-                            "pChange": p_change
+                            "pChange": p_change,
+                            "is_market_open": is_market_open
                         })
-                        socketio.emit("stock_price", tick_payload, room=f"chart_{token_id}_1d")
-                        socketio.emit("stock_price", tick_payload, room=f"chart_{display_name}_1d")
-                        socketio.emit("stock_price", tick_payload, room=f"chart_{ticker_sym}_1d")
+                        if _chart_symbol_clients.get(token_id):
+                            socketio.emit("stock_price", tick_payload, room=f"chart_{token_id}_1d")
 
-                    # Feed tick into real-time candle manager
-                    now_ts = time.time()
-                    realtime_candle_manager.process_tick(token_id, ltp, 1000, now_ts)
-                    realtime_candle_manager.process_tick(display_name, ltp, 1000, now_ts)
-                    realtime_candle_manager.process_tick(ticker_sym, ltp, 1000, now_ts)
+                    # Live candle generation and autotrade queues ONLY run when market is OPEN
+                    if is_market_open:
+                        now_ts = time.time()
+                        realtime_candle_manager.process_tick(token_id, ltp, 1000, now_ts)
 
-                    # Feed tick into automated trading engine to evaluate active stop-loss / target rules
-                    try:
-                        from app.services.autotrade_engine import autotrade_engine
-                        autotrade_engine.on_tick(token_id, ltp)
-                        if display_name != token_id:
-                            autotrade_engine.on_tick(display_name, ltp)
-                    except Exception:
-                        pass
+                        # Feed tick into autotrade worker queue (non-blocking)
+                        try:
+                            _tick_eval_queue.put_nowait((is_index, ticker_sym if is_index else token_id, ltp))
+                        except Exception:
+                            pass
 
-                # Emit live top gainers & losers to room 'indexes'
+                # Emit top gainers & losers to room 'indexes'
                 if stock_movers:
                     sorted_gainers = sorted(stock_movers, key=lambda x: x['pChange'], reverse=True)
                     socketio.emit("gainers_data", sorted_gainers[:5], room='indexes')
@@ -269,17 +357,23 @@ def _run_index_feeder():
             except Exception as e:
                 logger.error(f"Error in broadcaster: {e}")
 
-            eventlet.sleep(1.0)
+            # Sub-second cadence (1.0s) during market hours; calm 5.0s refresh when closed
+            eventlet.sleep(1.0 if is_market_open else 5.0)
     finally:
         _fallback_feeder_running = False
 
 def ensure_index_feeder():
     """Ensure both the index feeder, quote updater, and real-time candle manager are running."""
-    global _fallback_feeder_running
+    global _fallback_feeder_running, _tick_eval_worker_started
     from app.services.realtime_candle_manager import realtime_candle_manager
     realtime_candle_manager.start_broadcaster()
 
     with _feeder_lock:
+        if not _tick_eval_worker_started:
+            _tick_eval_worker_started = True
+            t_worker = threading.Thread(target=_tick_eval_worker, daemon=True)
+            t_worker.start()
+
         if not _fallback_feeder_running:
             _fallback_feeder_running = True
             # Start broadcaster in eventlet greenlet
@@ -342,11 +436,48 @@ def handle_subscribe_indexes(data=None):
     join_room('indexes')
     ensure_index_feeder()
 
+    # Send current market session status immediately to subscribing client
+    session_info = get_market_session_info()
+    emit("market_status", session_info)
+
+    # Immediately push current quotes so client has instant price display without waiting
+    with _quotes_lock:
+        current_quotes = dict(_shared_quotes)
+
+    for ticker_sym, token_id, display_name in INDEX_TARGETS:
+        q = current_quotes.get(ticker_sym)
+        if q:
+            ltp = q['ltp']
+            prev = q['prev']
+            change = round(ltp - prev, 2)
+            p_change = round((change / prev * 100), 2) if prev > 0 else 0.0
+            emit("indexes_data", {
+                "token": token_id,
+                "symbol": display_name,
+                "ticker": ticker_sym,
+                "ltp": round(ltp, 2),
+                "change": change,
+                "pChange": p_change,
+                "is_market_open": session_info.get("is_open", False),
+                "market_status": session_info.get("status", "CLOSED"),
+                "full_data": {
+                    "last_traded_price": round(ltp * 100),
+                    "closed_price": round(prev * 100),
+                    "open_price_of_the_day": round(q['open'] * 100),
+                    "high_price": round(q['high'] * 100),
+                    "low_price": round(q['low'] * 100),
+                }
+            })
+
     user = getattr(request, "user", {}) or {}
     client_code = user.get('angleClientCode')
 
     if not client_code:
-        emit("indexes_status", {"status": "subscribed", "mode": "stream_active"})
+        emit("indexes_status", {
+            "status": "subscribed",
+            "mode": "stream_active" if session_info.get("is_open") else "market_closed",
+            "is_market_open": session_info.get("is_open", False)
+        })
         return
 
     try:
@@ -439,6 +570,65 @@ class BackfillCache:
 
 backfill_cache = BackfillCache(ttl=60)
 
+_scrip_df = None
+_scrip_df_lock = threading.Lock()
+
+def get_scrip_df():
+    """Returns singleton cached DataFrame of Angel One scrip master (174k instruments)."""
+    global _scrip_df
+    if _scrip_df is None:
+        with _scrip_df_lock:
+            if _scrip_df is None:
+                try:
+                    from pathlib import Path
+                    import pandas as pd
+                    BASE_DIR = Path(__file__).resolve().parent
+                    csv_path = BASE_DIR / "index_data.csv"
+                    if csv_path.exists():
+                        _scrip_df = pd.read_csv(csv_path, low_memory=False)
+                        logger.info(f"Loaded {len(_scrip_df)} scrips into memory for ultra-fast token resolution.")
+                    else:
+                        _scrip_df = pd.DataFrame()
+                except Exception as e:
+                    logger.error(f"Error reading index_data.csv: {e}")
+                    _scrip_df = pd.DataFrame()
+    return _scrip_df
+
+def resolve_fno_token(underlying: str, option_type: str, strike: float):
+    """
+    Resolves F&O option contract to Angel One symbol, token, and lot size.
+    E.g. ('NIFTY', 'CE', 25000) -> ('NIFTY12MAY2625000CE', '41832', 65)
+    """
+    df = get_scrip_df()
+    if df.empty:
+        return None, None, None
+
+    clean_und = underlying.upper().replace(" ", "").replace("-", "")
+    if clean_und == "NIFTY50":
+        clean_und = "NIFTY"
+    elif clean_und in ("BANKNIFTY", "NIFTYBANK"):
+        clean_und = "BANKNIFTY"
+    elif clean_und in ("FINNIFTY", "NIFTYFINSERVICE"):
+        clean_und = "FINNIFTY"
+
+    clean_opt = option_type.upper()
+    strike_val = float(strike) * 100.0  # Angel One strikes are in paise (e.g. 2500000.0)
+
+    try:
+        matches = df[
+            (df['name'] == clean_und) &
+            (df['instrumenttype'] == 'OPTIDX') &
+            (df['symbol'].str.endswith(clean_opt)) &
+            (df['strike'] == strike_val)
+        ]
+        if not matches.empty:
+            row = matches.iloc[0]
+            return str(row['symbol']), str(row['token']), int(row.get('lotsize', 1) or 1)
+    except Exception as e:
+        logger.error(f"Error resolving F&O token for {underlying} {strike} {option_type}: {e}")
+
+    return None, None, None
+
 def resolve_symbol_to_token(symbol):
     """Resolves symbol (e.g. RELIANCE.NS, Nifty 50, Bank Nifty) to Angel One token and exchange."""
     direct_map = {
@@ -468,21 +658,17 @@ def resolve_symbol_to_token(symbol):
     elif not clean_sym.endswith('-EQ') and clean_sym.isalnum():
         clean_sym = clean_sym + '-EQ'
 
-    # Search in index_data.csv
+    # Search in cached scrip master
     try:
-        from pathlib import Path
-        import pandas as pd
-        BASE_DIR = Path(__file__).resolve().parent
-        csv_path = BASE_DIR / "index_data.csv"
-        if csv_path.exists():
-            df = pd.read_csv(csv_path)
+        df = get_scrip_df()
+        if not df.empty:
             match = df[df['symbol'].str.upper() == clean_sym.upper()]
             if not match.empty:
                 token_val = str(match.iloc[0]['token'])
                 exch_seg = str(match.iloc[0].get('exch_seg', 'NSE'))
                 return token_val, exch_seg
     except Exception as e:
-        logger.error(f"Error reading index_data.csv for token resolution: {e}")
+        logger.error(f"Error querying scrip master for token resolution: {e}")
 
     if symbol.isdigit():
         return symbol, 'NSE'

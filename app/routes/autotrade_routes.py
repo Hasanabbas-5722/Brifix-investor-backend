@@ -4,7 +4,7 @@ from datetime import datetime
 from app.utils.logger import get_logger
 from app.utils.access_token_validate import validate_access_token
 from app.models.user import db
-from app.services.autotrade_engine import autotrade_engine
+from app.services.autotrade_engine import autotrade_engine, check_market_session
 
 logger = get_logger(__name__)
 autotrade_bp = Blueprint("autotrade", __name__, url_prefix="/api/v1/autotrade")
@@ -32,26 +32,32 @@ def toggle_auto_trade():
 
     data = request.get_json(silent=True) or {}
     enable = bool(data.get("enabled", False))
-    cfg = autotrade_engine.toggle_engine(uid, enable)
+    try:
+        cfg = autotrade_engine.toggle_engine(uid, enable)
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 400
 
-    # Make sure engine loop is running
+    # Ensure background worker thread is running
     autotrade_engine.start()
 
     eval_result = {}
-    if enable:
-        try:
-            eval_result = autotrade_engine.evaluate_user(uid, force_scan=True)
-        except Exception as e:
-            logger.error(f"Error during on-demand autotrade evaluation: {e}")
-
-    new_positions = eval_result.get("new_positions", []) if eval_result else []
-    new_count = len(new_positions)
+    is_open, status_code, status_msg = check_market_session()
 
     if enable:
-        if new_count > 0:
-            msg = f"Automated trading ACTIVATED. AI scanned Indian stocks and opened {new_count} positions with >80% confidence."
+        if is_open:
+            try:
+                eval_result = autotrade_engine.evaluate_user(uid, force_scan=True)
+            except Exception as e:
+                logger.error(f"Error during on-demand autotrade evaluation: {e}")
+
+            new_positions = eval_result.get("new_positions", []) if eval_result else []
+            new_count = len(new_positions)
+            if new_count > 0:
+                msg = f"Automated trading ACTIVATED. AI scanned Indian stocks and opened {new_count} positions with >80% confidence."
+            else:
+                msg = "Automated trading ACTIVATED. Engine scanning for setups with >80% AI confidence."
         else:
-            msg = "Automated trading ACTIVATED. Engine scanning for setups with >80% AI confidence."
+            msg = f"Automated trading ACTIVATED in Standby Mode. {status_msg}"
     else:
         msg = "Automated trading STOPPED."
 
@@ -59,6 +65,7 @@ def toggle_auto_trade():
         "status": "success",
         "enabled": cfg.get("enabled", False),
         "config": cfg,
+        "market_session": {"is_open": is_open, "status": status_code, "message": status_msg},
         "eval_result": eval_result,
         "message": msg
     })
@@ -71,6 +78,13 @@ def scan_and_trade():
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
+
+    is_open, status_code, status_msg = check_market_session()
+    if not is_open:
+        return jsonify({
+            "status": "market_closed",
+            "message": f"Market is currently closed: {status_msg}"
+        }), 400
 
     try:
         eval_result = autotrade_engine.evaluate_user(uid, force_scan=True)
@@ -97,8 +111,13 @@ def get_config():
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
 
+    is_open, status_code, status_msg = check_market_session()
     cfg = autotrade_engine.get_user_config(uid)
-    return jsonify({"status": "success", "config": cfg})
+    return jsonify({
+        "status": "success",
+        "config": cfg,
+        "market_session": {"is_open": is_open, "status": status_code, "message": status_msg}
+    })
 
 
 @autotrade_bp.route("/config", methods=["POST"])
@@ -110,7 +129,10 @@ def update_config():
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
-    updated = autotrade_engine.update_user_config(uid, data)
+    try:
+        updated = autotrade_engine.update_user_config(uid, data)
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 400
 
     return jsonify({
         "status": "success",
@@ -126,14 +148,6 @@ def get_open_positions():
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
-
-    # If automation is active for this user, evaluate breakout recommendations & position status
-    cfg = autotrade_engine.get_user_config(uid)
-    if cfg.get("enabled", False):
-        try:
-            autotrade_engine.evaluate_user(uid)
-        except Exception as eval_err:
-            logger.debug(f"Position sync evaluation: {eval_err}")
 
     docs = list(db.autotrade_positions.find({"userId": uid, "status": "OPEN"}).sort("entryTime", -1))
     from app.socket.indexes import _shared_quotes
