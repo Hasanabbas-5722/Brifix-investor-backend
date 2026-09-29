@@ -19,6 +19,51 @@ def get_ist_time() -> datetime:
     return datetime.now(timezone.utc).astimezone(IST_TZ)
 
 
+def to_ist_datetime(value=None) -> datetime:
+    """Convert a UTC/naive datetime or ISO string into an aware IST datetime."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).astimezone(IST_TZ)
+        return value.astimezone(IST_TZ)
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(IST_TZ)
+        except Exception:
+            pass
+    return get_ist_time()
+
+
+def format_ist_datetime(value=None) -> str:
+    """Format datetime in Indian Standard Time: '29 Sep 2026, 11:08:15 AM IST'."""
+    ist_dt = to_ist_datetime(value)
+    return ist_dt.strftime("%d %b %Y, %I:%M:%S %p IST")
+
+
+def format_ist_date_key(value=None) -> str:
+    """Return 'YYYY-MM-DD' date key in Indian Standard Time (IST)."""
+    ist_dt = to_ist_datetime(value)
+    return ist_dt.strftime("%Y-%m-%d")
+
+
+def format_ist_display_date(value=None) -> str:
+    """Return human-friendly Indian date label, e.g. 'Today • 29 Sep 2026' or '28 Sep 2026'."""
+    ist_dt = to_ist_datetime(value)
+    date_key = ist_dt.strftime("%Y-%m-%d")
+    today_dt = get_ist_time()
+    today_key = today_dt.strftime("%Y-%m-%d")
+    yesterday_key = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    base_label = ist_dt.strftime("%d %b %Y")
+    if date_key == today_key:
+        return f"Today • {base_label}"
+    if date_key == yesterday_key:
+        return f"Yesterday • {base_label}"
+    return base_label
+
+
 # Official NSE Trading Holidays (Format: 'YYYY-MM-DD': 'Holiday Name')
 # Sources: NSE Circulars for Trading Holidays
 NSE_HOLIDAYS = {

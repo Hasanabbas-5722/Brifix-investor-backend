@@ -6,6 +6,12 @@ from app.utils.access_token_validate import validate_access_token
 from app.models.user import db
 from app.services.fno_autotrade_engine import fno_autotrade_engine, check_market_session
 from app.services.fno_prediction_service import FNOPredictionService
+from app.utils.market_calendar import (
+    get_ist_time,
+    format_ist_datetime,
+    format_ist_date_key,
+    format_ist_display_date,
+)
 
 logger = get_logger(__name__)
 fno_bp = Blueprint("fno", __name__, url_prefix="/api/v1/fno")
@@ -180,7 +186,8 @@ def get_open_fno_positions():
         entry_idx = float(d.get("entryIndexPrice", 0.0))
         opt_type = str(d.get("optionType", "CE")).upper()
         delta = float(d.get("delta", 0.50))
-        highest_prem = float(d.get("highestPremium", entry_prem))
+        prev_high = float(d.get("highestPremium", entry_prem))
+        prev_curr = float(d.get("currentPremium", entry_prem))
 
         # Real-time repricing from live shared quotes
         und = d.get("underlying")
@@ -194,15 +201,53 @@ def get_open_fno_positions():
             prem_diff = delta * idx_diff if opt_type == "CE" else -delta * idx_diff
             curr_prem = max(round(entry_prem + prem_diff, 2), 1.0)
         else:
-            curr_prem = float(d.get("currentPremium", entry_prem))
+            curr_prem = prev_curr
 
-        highest_prem = max(highest_prem, curr_prem)
+        highest_prem = max(prev_high, curr_prem)
+        default_init_sl = round(max(entry_prem - 10.0, entry_prem * 0.80), 2)
+        sl_prem = float(d.get("stopLossPremium", default_init_sl))
+        initial_sl_prem = float(d.get("initialStopLossPremium", min(sl_prem, default_init_sl)))
+
+        raw_gap = entry_prem - initial_sl_prem
+        risk_gap = min(max(raw_gap, 1.0), 10.0) if raw_gap > 0 else 10.0
+
+        if highest_prem > entry_prem:
+            sl_from_entry = round(initial_sl_prem + (highest_prem - entry_prem), 2)
+            sl_prem = max(sl_prem, sl_from_entry)
+
+        if highest_prem > prev_high:
+            sl_from_high_step = round(sl_prem + (highest_prem - prev_high), 2)
+            sl_prem = max(sl_prem, sl_from_high_step)
+
+        if curr_prem > prev_curr or curr_prem > entry_prem:
+            sl_from_live_gap = round(curr_prem - risk_gap, 2)
+            if sl_from_live_gap > sl_prem:
+                sl_prem = sl_from_live_gap
+
+        if (curr_prem != prev_curr) or (highest_prem > prev_high) or (sl_prem > float(d.get("stopLossPremium", 0))):
+            try:
+                db.fno_autotrade_positions.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {
+                        "currentPremium": curr_prem,
+                        "highestPremium": highest_prem,
+                        "stopLossPremium": sl_prem,
+                        "initialStopLossPremium": initial_sl_prem,
+                    }}
+                )
+            except Exception:
+                pass
 
         pnl = round((curr_prem - entry_prem) * qty, 2)
         pnl_pct = round(((curr_prem - entry_prem) / entry_prem * 100.0), 2) if entry_prem > 0 else 0.0
         total_unrealized_pnl += pnl
 
-        entry_time_str = d["entryTime"].isoformat() if isinstance(d.get("entryTime"), datetime) else str(d.get("entryTime", ""))
+        entry_time_ist = d.get("entryTimeIST") or format_ist_datetime(d.get("entryTime"))
+        entry_date_ist = d.get("entryDateIST") or format_ist_date_key(d.get("entryTime"))
+        display_date_ist = d.get("displayDateIST") or format_ist_display_date(d.get("entryTime"))
+
+        profit_target_inr = float(d.get("profitTargetInr", 300.0))
+        default_tp_prem = round(entry_prem + (profit_target_inr / max(qty, 1)), 2)
 
         positions.append({
             "id": str(d["_id"]),
@@ -215,8 +260,10 @@ def get_open_fno_positions():
             "quantity": qty,
             "entry_premium": entry_prem,
             "current_premium": curr_prem,
-            "stop_loss_premium": float(d.get("stopLossPremium", entry_prem * 0.80)),
-            "target_premium": float(d.get("targetPremium", entry_prem * 1.40)),
+            "initial_stop_loss_premium": initial_sl_prem,
+            "stop_loss_premium": sl_prem,
+            "target_premium": float(d.get("targetPremium", default_tp_prem)),
+            "profit_target_inr": profit_target_inr,
             "highest_premium": highest_prem,
             "entry_index_price": entry_idx if entry_idx > 0 else live_ltp,
             "delta": delta,
@@ -225,7 +272,11 @@ def get_open_fno_positions():
             "trade_mode": d.get("tradeMode", "paper"),
             "ai_confidence": d.get("aiConfidence", 75),
             "signal": d.get("signal", "CALL_BUY"),
-            "entry_time": entry_time_str
+            "strategy_name": d.get("strategyName", "VWAP + Supertrend(7,3) + CPR Breakout + PCR OI Confluence"),
+            "entry_reasons": d.get("entryReasons", []),
+            "entry_time": entry_time_ist,
+            "date_ist": entry_date_ist,
+            "display_date_ist": display_date_ist,
         })
 
     return jsonify({
@@ -239,22 +290,33 @@ def get_open_fno_positions():
 @fno_bp.route("/history", methods=["GET"])
 @validate_access_token
 def get_fno_trade_history():
-    """Fetch completed F&O trade history."""
+    """Fetch completed F&O trade history across all days with IST dates/times and daily P&L summary."""
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
 
-    docs = list(db.fno_autotrade_positions.find({"userId": uid, "status": "CLOSED"}).sort("exitTime", -1).limit(50))
+    today_str = get_ist_time().strftime("%Y-%m-%d")
+    docs = list(db.fno_autotrade_positions.find({"userId": uid, "status": "CLOSED"}).sort("exitTime", -1).limit(500))
     trades = []
-    total_realized_pnl = 0.0
+    today_realized_pnl = 0.0
+    all_time_realized_pnl = 0.0
+    daily_map = {}
 
     for d in docs:
-        pnl = float(d.get("realizedPnL", 0.0))
-        total_realized_pnl += pnl
-        entry_time_str = d["entryTime"].isoformat() if isinstance(d.get("entryTime"), datetime) else str(d.get("entryTime", ""))
-        exit_time_str = d["exitTime"].isoformat() if isinstance(d.get("exitTime"), datetime) else str(d.get("exitTime", ""))
+        pnl = round(float(d.get("realizedPnL", 0.0)), 2)
+        all_time_realized_pnl += pnl
 
-        trades.append({
+        raw_entry = d.get("entryTime")
+        raw_exit = d.get("exitTime") or raw_entry
+        entry_time_ist = d.get("entryTimeIST") or format_ist_datetime(raw_entry)
+        exit_time_ist = d.get("exitTimeIST") or format_ist_datetime(raw_exit)
+        date_ist = d.get("exitDateIST") or format_ist_date_key(raw_exit)
+        display_date_ist = format_ist_display_date(raw_exit)
+
+        if date_ist == today_str:
+            today_realized_pnl += pnl
+
+        trade_item = {
             "id": str(d["_id"]),
             "symbol": d.get("symbol"),
             "underlying": d.get("underlying"),
@@ -266,16 +328,52 @@ def get_fno_trade_history():
             "exit_premium": d.get("exitPremium"),
             "exit_reason": d.get("exitReason", "CLOSED"),
             "pnl": pnl,
-            "pnl_pct": float(d.get("realizedPnLPct", 0.0)),
+            "pnl_pct": round(float(d.get("realizedPnLPct", 0.0)), 2),
             "trade_mode": d.get("tradeMode", "paper"),
-            "entry_time": entry_time_str,
-            "exit_time": exit_time_str
-        })
+            "entry_time": entry_time_ist,
+            "exit_time": exit_time_ist,
+            "date_ist": date_ist,
+            "display_date_ist": display_date_ist,
+        }
+        trades.append(trade_item)
+
+        if date_ist not in daily_map:
+            daily_map[date_ist] = {
+                "date_ist": date_ist,
+                "display_date": display_date_ist,
+                "is_today": date_ist == today_str,
+                "total_pnl": 0.0,
+                "trades_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "trades": [],
+            }
+        bucket = daily_map[date_ist]
+        bucket["total_pnl"] = round(bucket["total_pnl"] + pnl, 2)
+        bucket["trades_count"] += 1
+        if pnl >= 0:
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+        bucket["trades"].append(trade_item)
+
+    daily_history = []
+    for k in sorted(daily_map.keys(), reverse=True):
+        b = daily_map[k]
+        cnt = b["trades_count"]
+        b["win_rate"] = round((b["wins"] / cnt) * 100.0, 1) if cnt > 0 else 0.0
+        b["is_loss_day"] = b["total_pnl"] < 0
+        b["status_label"] = "LOSS DAY" if b["total_pnl"] < 0 else ("PROFIT DAY" if b["total_pnl"] > 0 else "BREAKEVEN")
+        daily_history.append(b)
 
     return jsonify({
         "status": "success",
+        "today_date_ist": today_str,
+        "today_realized_pnl": round(today_realized_pnl, 2),
+        "total_realized_pnl": round(today_realized_pnl, 2),
+        "all_time_realized_pnl": round(all_time_realized_pnl, 2),
         "history": trades,
-        "total_realized_pnl": round(total_realized_pnl, 2),
+        "daily_history": daily_history,
         "total_trades": len(trades)
     })
 
@@ -295,12 +393,14 @@ def emergency_exit_fno():
 @fno_bp.route("/positions/<pos_id>/exit", methods=["POST"])
 @validate_access_token
 def exit_single_fno_position(pos_id):
-    """Square off a specific open F&O option position manually."""
+    """Square off a specific open F&O option position manually at locked/instant price."""
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
 
-    res = fno_autotrade_engine.close_single_fno_position(uid, pos_id)
+    body = request.get_json(silent=True) or {}
+    exit_price = body.get("exit_price")
+    res = fno_autotrade_engine.close_single_fno_position(uid, pos_id, exit_price=exit_price)
     code = 200 if res.get("status") == "success" else 400
     return jsonify(res), code
 

@@ -5,6 +5,12 @@ from app.utils.logger import get_logger
 from app.utils.access_token_validate import validate_access_token
 from app.models.user import db
 from app.services.autotrade_engine import autotrade_engine, check_market_session
+from app.utils.market_calendar import (
+    get_ist_time,
+    format_ist_datetime,
+    format_ist_date_key,
+    format_ist_display_date,
+)
 
 logger = get_logger(__name__)
 autotrade_bp = Blueprint("autotrade", __name__, url_prefix="/api/v1/autotrade")
@@ -162,11 +168,50 @@ def get_open_positions():
         q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
         ltp = float(q.get("ltp", entry))
 
+        prev_high = float(d.get("highestPrice", entry))
+        prev_curr = float(d.get("currentPrice", entry))
+        highest = max(prev_high, ltp)
+        initial_sl = float(d.get("initialStopLossPrice", round(entry * 0.985, 2)))
+        stored_sl = float(d.get("stopLossPrice", initial_sl))
+
+        raw_gap = entry - initial_sl
+        risk_gap = max(raw_gap, 1.0) if raw_gap > 0 else round(entry * 0.015, 2)
+        live_sl = stored_sl
+
+        if highest > entry:
+            sl_from_entry = round(initial_sl + (highest - entry), 2)
+            live_sl = max(live_sl, sl_from_entry)
+
+        if highest > prev_high:
+            sl_from_high_step = round(stored_sl + (highest - prev_high), 2)
+            live_sl = max(live_sl, sl_from_high_step)
+
+        if ltp > prev_curr or ltp > entry:
+            sl_from_live_gap = round(ltp - risk_gap, 2)
+            if sl_from_live_gap > live_sl:
+                live_sl = sl_from_live_gap
+
+        if (ltp != prev_curr) or (highest > prev_high) or (live_sl > stored_sl):
+            try:
+                db.autotrade_positions.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {
+                        "currentPrice": ltp,
+                        "highestPrice": highest,
+                        "stopLossPrice": live_sl,
+                        "initialStopLossPrice": initial_sl,
+                    }}
+                )
+            except Exception:
+                pass
+
         pnl = round((ltp - entry) * qty, 2)
         pnl_pct = round(((ltp - entry) / entry * 100), 2) if entry > 0 else 0
         total_unrealized_pnl += pnl
 
-        entry_time_str = d["entryTime"].isoformat() if isinstance(d.get("entryTime"), datetime) else str(d.get("entryTime", ""))
+        entry_time_ist = d.get("entryTimeIST") or format_ist_datetime(d.get("entryTime"))
+        entry_date_ist = d.get("entryDateIST") or format_ist_date_key(d.get("entryTime"))
+        display_date_ist = d.get("displayDateIST") or format_ist_display_date(entry_date_ist)
 
         positions.append({
             "id": str(d["_id"]),
@@ -174,14 +219,17 @@ def get_open_positions():
             "quantity": qty,
             "entry_price": entry,
             "current_price": ltp,
-            "stop_loss_price": float(d.get("stopLossPrice", entry * 0.985)),
-            "target_price": float(d.get("targetPrice", entry * 1.03)),
-            "highest_price": float(d.get("highestPrice", entry)),
+            "initial_stop_loss_price": initial_sl,
+            "stop_loss_price": live_sl,
+            "target_price": float(d.get("targetPrice", entry * 1.045)),
+            "highest_price": highest,
             "pnl": pnl,
             "pnl_pct": pnl_pct,
             "trade_mode": d.get("tradeMode", "paper"),
             "ai_confidence": d.get("aiConfidence", 80),
-            "entry_time": entry_time_str
+            "entry_time": entry_time_ist,
+            "entry_date_ist": entry_date_ist,
+            "display_date_ist": display_date_ist,
         })
 
     return jsonify({
@@ -195,22 +243,33 @@ def get_open_positions():
 @autotrade_bp.route("/history", methods=["GET"])
 @validate_access_token
 def get_trade_history():
-    """Fetch completed automated trade history."""
+    """Fetch completed automated trade history with all-day date-wise breakdown in IST."""
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
 
-    docs = list(db.autotrade_positions.find({"userId": uid, "status": "CLOSED"}).sort("exitTime", -1).limit(50))
+    docs = list(db.autotrade_positions.find({"userId": uid, "status": "CLOSED"}).sort("exitTime", -1).limit(500))
     trades = []
     total_realized_pnl = 0.0
+    today_realized_pnl = 0.0
+    today_str = get_ist_time().strftime("%Y-%m-%d")
+    daily_groups = {}
 
     for d in docs:
-        pnl = float(d.get("realizedPnL", 0.0))
+        pnl = round(float(d.get("realizedPnL", 0.0)), 2)
         total_realized_pnl += pnl
-        entry_time_str = d["entryTime"].isoformat() if isinstance(d.get("entryTime"), datetime) else str(d.get("entryTime", ""))
-        exit_time_str = d["exitTime"].isoformat() if isinstance(d.get("exitTime"), datetime) else str(d.get("exitTime", ""))
 
-        trades.append({
+        entry_dt = d.get("entryTime")
+        exit_dt = d.get("exitTime") or entry_dt
+        entry_time_ist = d.get("entryTimeIST") or format_ist_datetime(entry_dt)
+        exit_time_ist = d.get("exitTimeIST") or format_ist_datetime(exit_dt)
+        date_ist = d.get("exitDateIST") or format_ist_date_key(exit_dt)
+        display_date_ist = format_ist_display_date(date_ist)
+
+        if date_ist == today_str:
+            today_realized_pnl += pnl
+
+        trade_item = {
             "id": str(d["_id"]),
             "symbol": d.get("symbol"),
             "quantity": d.get("quantity"),
@@ -220,16 +279,69 @@ def get_trade_history():
             "pnl": pnl,
             "pnl_pct": float(d.get("realizedPnLPct", 0.0)),
             "trade_mode": d.get("tradeMode", "paper"),
-            "entry_time": entry_time_str,
-            "exit_time": exit_time_str
-        })
+            "entry_time": entry_time_ist,
+            "exit_time": exit_time_ist,
+            "date_ist": date_ist,
+            "display_date_ist": display_date_ist,
+        }
+        trades.append(trade_item)
+
+        if date_ist not in daily_groups:
+            daily_groups[date_ist] = {
+                "date_ist": date_ist,
+                "display_date_ist": display_date_ist,
+                "is_today": date_ist == today_str,
+                "total_pnl": 0.0,
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "trades": [],
+            }
+        grp = daily_groups[date_ist]
+        grp["total_pnl"] = round(grp["total_pnl"] + pnl, 2)
+        grp["total_trades"] += 1
+        if pnl >= 0:
+            grp["wins"] += 1
+        else:
+            grp["losses"] += 1
+        grp["trades"].append(trade_item)
+
+    daily_history = []
+    for date_key in sorted(daily_groups.keys(), reverse=True):
+        grp = daily_groups[date_key]
+        grp["is_loss_day"] = grp["total_pnl"] < 0
+        grp["status_label"] = (
+            "LOSS DAY" if grp["total_pnl"] < 0 else ("PROFIT DAY" if grp["total_pnl"] > 0 else "BREAKEVEN")
+        )
+        grp["win_rate"] = round((grp["wins"] / grp["total_trades"]) * 100.0, 1) if grp["total_trades"] > 0 else 0.0
+        daily_history.append(grp)
 
     return jsonify({
         "status": "success",
         "history": trades,
-        "total_realized_pnl": round(total_realized_pnl, 2),
+        "daily_history": daily_history,
+        "today_date_ist": today_str,
+        "today_realized_pnl": round(today_realized_pnl, 2),
+        "total_realized_pnl": round(today_realized_pnl, 2),
+        "all_time_realized_pnl": round(total_realized_pnl, 2),
         "total_trades": len(trades)
     })
+
+
+@autotrade_bp.route("/positions/<pos_id>/exit", methods=["POST"])
+@validate_access_token
+def exit_single_position(pos_id):
+    """Square off a single open equity position immediately with zero slippage."""
+    uid = _get_uid()
+    if not uid:
+        return jsonify({"status": "failed", "error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    exit_price = data.get("exit_price")
+    res = autotrade_engine.close_single_position(uid, pos_id, exit_price=exit_price)
+    if res.get("status") == "failed":
+        return jsonify(res), 400
+    return jsonify(res)
 
 
 @autotrade_bp.route("/emergency_exit", methods=["POST"])

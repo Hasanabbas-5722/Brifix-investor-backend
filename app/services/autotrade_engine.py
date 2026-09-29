@@ -5,7 +5,14 @@ from bson import ObjectId
 from app.utils.logger import get_logger
 from app.models.user import db
 from app.services.broker_service import get_broker_for_user, LiveBrokerError
-from app.utils.market_calendar import check_market_session, get_ist_time, is_market_holiday
+from app.utils.market_calendar import (
+    check_market_session,
+    get_ist_time,
+    is_market_holiday,
+    format_ist_datetime,
+    format_ist_date_key,
+    format_ist_display_date,
+)
 
 logger = get_logger(__name__)
 
@@ -55,9 +62,9 @@ class AutoTradeEngine:
                 "enabled": False,
                 "tradeMode": "paper",  # "paper" or "live"
                 "maxCapitalPerTrade": 10000.0,
-                "riskRewardRatio": 2.0,  # 1:2
+                "riskRewardRatio": 3.0,  # 1:3 Smart Risk-Reward
                 "stopLossPct": 1.5,      # 1.5%
-                "takeProfitPct": 3.0,    # 1.5% * 2.0 = 3.0%
+                "takeProfitPct": 4.5,    # 1.5% * 3.0 = 4.5%
                 "trailingStopLoss": True,
                 "dailyMaxLoss": 5000.0,
                 "dailyRealizedPnL": 0.0,
@@ -68,15 +75,30 @@ class AutoTradeEngine:
             }
             db.autotrade_configs.insert_one(cfg)
 
-        # Check daily PnL reset at midnight IST
+        # Strictly compute Today's Realized P&L from closed trades belonging to today's IST date
         today_str = get_ist_time().strftime("%Y-%m-%d")
+        today_closed_docs = list(db.autotrade_positions.find({"userId": uid, "status": "CLOSED"}))
+        today_realized_pnl = 0.0
+        for d in today_closed_docs:
+            exit_dt = d.get("exitTime") or d.get("entryTime")
+            d_date = d.get("exitDateIST") or format_ist_date_key(exit_dt)
+            if d_date == today_str:
+                today_realized_pnl += float(d.get("realizedPnL", 0.0))
+        today_realized_pnl = round(today_realized_pnl, 2)
+
+        update_set = {}
         if cfg.get("lastResetDate") != today_str:
-            db.autotrade_configs.update_one(
-                {"userId": uid},
-                {"$set": {"dailyRealizedPnL": 0.0, "lastResetDate": today_str}}
-            )
-            cfg["dailyRealizedPnL"] = 0.0
+            # New IST day: reset daily PnL to today's actual (0.0) and disable left-over enabled state
+            update_set["lastResetDate"] = today_str
+            update_set["enabled"] = False
             cfg["lastResetDate"] = today_str
+            cfg["enabled"] = False
+        if round(float(cfg.get("dailyRealizedPnL", 0.0)), 2) != today_realized_pnl:
+            update_set["dailyRealizedPnL"] = today_realized_pnl
+
+        if update_set:
+            db.autotrade_configs.update_one({"userId": uid}, {"$set": update_set})
+        cfg["dailyRealizedPnL"] = today_realized_pnl
 
         cfg["_id"] = str(cfg["_id"])
         return cfg
@@ -91,7 +113,7 @@ class AutoTradeEngine:
             get_broker_for_user(user_doc, user_id=uid, trade_mode="live")
 
         sl = float(updates.get("stopLossPct", 1.5))
-        rr = float(updates.get("riskRewardRatio", 2.0))
+        rr = float(updates.get("riskRewardRatio", 3.0))
         tp = round(sl * rr, 2)
 
         set_fields = {
@@ -157,22 +179,37 @@ class AutoTradeEngine:
             user_id = pos["userId"]
             entry = float(pos.get("entryPrice", ltp))
             sl = float(pos.get("stopLossPrice", entry * 0.985))
-            target = float(pos.get("targetPrice", entry * 1.03))
-            highest = max(float(pos.get("highestPrice", entry)), ltp)
+            target = float(pos.get("targetPrice", entry * 1.045))
+            prev_high = float(pos.get("highestPrice", entry))
+            prev_curr = float(pos.get("currentPrice", entry))
+            highest = max(prev_high, ltp)
             qty = int(pos.get("quantity", 1))
 
             # Fetch user configuration
             cfg = self.get_user_config(user_id)
             trailing = cfg.get("trailingStopLoss", True)
+            sl_pct = float(cfg.get("stopLossPct", 1.5))
+            initial_sl = float(pos.get("initialStopLossPrice", round(entry * (1 - sl_pct / 100.0), 2)))
 
-            # 1. Update Trailing Stop Loss if price rises favorably
+            # 1. Continuous Real-Time Smart Trailing Stop Loss:
+            # Whenever price increases by +X, Stop-Loss automatically increases by +X in real-time.
             new_sl = sl
-            if trailing and ltp > entry:
-                profit_margin = ltp - entry
-                sl_distance = entry * (float(cfg.get("stopLossPct", 1.5)) / 100.0)
-                tentative_sl = round(ltp - sl_distance, 2)
-                if tentative_sl > sl:
-                    new_sl = tentative_sl
+            if trailing:
+                raw_gap = entry - initial_sl
+                risk_gap = max(raw_gap, 1.0) if raw_gap > 0 else round(entry * (sl_pct / 100.0), 2)
+
+                if highest > entry:
+                    sl_from_entry = round(initial_sl + (highest - entry), 2)
+                    new_sl = max(new_sl, sl_from_entry)
+
+                if highest > prev_high:
+                    sl_from_high_step = round(sl + (highest - prev_high), 2)
+                    new_sl = max(new_sl, sl_from_high_step)
+
+                if ltp > prev_curr or ltp > entry:
+                    sl_from_live_gap = round(ltp - risk_gap, 2)
+                    if sl_from_live_gap > new_sl:
+                        new_sl = sl_from_live_gap
 
             # Update DB with latest LTP, highest price & trailing SL
             db.autotrade_positions.update_one(
@@ -180,13 +217,16 @@ class AutoTradeEngine:
                 {"$set": {
                     "currentPrice": ltp,
                     "highestPrice": highest,
-                    "stopLossPrice": new_sl
+                    "stopLossPrice": new_sl,
+                    "initialStopLossPrice": initial_sl
                 }}
             )
 
-            # 2. Check Take Profit Hit
-            if ltp >= target:
-                self._close_position(pos, ltp, "TARGET_HIT")
+            # 2. Check ₹300+ Profit Target Hit (or Target Price Hit)
+            profit_target_inr = float(pos.get("profitTargetInr", cfg.get("profitTargetInr", 300.0)))
+            current_pnl = round((ltp - entry) * qty, 2)
+            if current_pnl >= profit_target_inr or ltp >= target:
+                self._close_position(pos, ltp, "PROFIT_300_TARGET_HIT")
                 continue
 
             # Anti-jitter hysteresis: protect positions for the first 5 seconds after entry
@@ -198,9 +238,9 @@ class AutoTradeEngine:
                 if age_seconds < 5.0:
                     continue
 
-            # 3. Check Stop Loss Hit (Cut Loss)
+            # 3. Check Stop Loss Hit (Cut Loss or Lock Trailed Profit)
             if ltp <= new_sl:
-                is_trailing = new_sl > entry
+                is_trailing = new_sl > (initial_sl + 0.01)
                 reason = "TRAILING_SL_HIT" if is_trailing else "STOP_LOSS_HIT"
                 exit_price = max(ltp, new_sl) if is_trailing else ltp
                 self._close_position(pos, exit_price, reason)
@@ -226,6 +266,12 @@ class AutoTradeEngine:
         realized_pct = round(((exit_price - entry) / entry * 100), 2) if entry > 0 else 0
 
         # Update position record
+        exit_dt = datetime.utcnow()
+        exit_date_ist = format_ist_date_key(exit_dt)
+        exit_time_ist = format_ist_datetime(exit_dt)
+        entry_date_ist = pos.get("entryDateIST") or format_ist_date_key(pos.get("entryTime") or exit_dt)
+        entry_time_ist = pos.get("entryTimeIST") or format_ist_datetime(pos.get("entryTime") or exit_dt)
+
         db.autotrade_positions.update_one(
             {"_id": pos_id},
             {"$set": {
@@ -234,7 +280,12 @@ class AutoTradeEngine:
                 "exitReason": reason,
                 "realizedPnL": realized_pnl,
                 "realizedPnLPct": realized_pct,
-                "exitTime": datetime.utcnow()
+                "exitTime": exit_dt,
+                "exitDateIST": exit_date_ist,
+                "exitTimeIST": exit_time_ist,
+                "entryDateIST": entry_date_ist,
+                "entryTimeIST": entry_time_ist,
+                "displayDateIST": format_ist_display_date(exit_date_ist),
             }}
         )
 
@@ -254,6 +305,43 @@ class AutoTradeEngine:
             logger.warning(f"[AutoTradeEngine] Circuit breaker tripped for user {user_id}! Daily loss reached ₹{cfg.get('dailyRealizedPnL')}")
 
         logger.info(f"[AutoTradeEngine] Closed {symbol} ({reason}): {qty}x @ ₹{exit_price} | P&L: ₹{realized_pnl} ({realized_pct}%)")
+
+    def close_single_position(self, user_id: str, pos_id_str: str, exit_price: float = None) -> dict:
+        """Manually square off a single open equity position immediately with zero slippage."""
+        uid = str(user_id)
+        if not ObjectId.is_valid(pos_id_str):
+            return {"status": "failed", "error": "Invalid position ID"}
+
+        pos = db.autotrade_positions.find_one({"_id": ObjectId(pos_id_str), "userId": uid, "status": "OPEN"})
+        if not pos:
+            return {"status": "failed", "error": "Open position not found or already closed"}
+
+        sym = pos["symbol"]
+        locked_ltp = None
+        if exit_price is not None:
+            try:
+                val = float(exit_price)
+                if val > 0:
+                    locked_ltp = round(val, 2)
+            except (ValueError, TypeError):
+                pass
+
+        if locked_ltp is None:
+            from app.socket.indexes import _shared_quotes
+            q = _shared_quotes.get(f"{sym}.NS") or _shared_quotes.get(sym) or {}
+            locked_ltp = float(q.get("ltp") or pos.get("currentPrice") or pos.get("entryPrice") or 100.0)
+
+        self._close_position(pos, locked_ltp, "MANUAL_EXIT")
+        qty = int(pos.get("quantity", 1))
+        entry = float(pos.get("entryPrice", locked_ltp))
+        realized_pnl = round((locked_ltp - entry) * qty, 2)
+
+        return {
+            "status": "success",
+            "message": f"Position {sym} squared off at ₹{locked_ltp}",
+            "exit_price": locked_ltp,
+            "realized_pnl": realized_pnl
+        }
 
     def emergency_exit_all(self, user_id: str) -> dict:
         """Panic kill switch: immediately disable automation and close all open positions at market price."""
@@ -435,7 +523,7 @@ class AutoTradeEngine:
 
                 # Calculate Risk-Reward parameters
                 sl_pct = float(cfg.get("stopLossPct", 1.5))
-                rr = float(cfg.get("riskRewardRatio", 2.0))
+                rr = float(cfg.get("riskRewardRatio", 3.0))
                 tp_pct = round(sl_pct * rr, 2)
 
                 sl_price = round(ltp * (1 - sl_pct / 100), 2)
@@ -453,18 +541,25 @@ class AutoTradeEngine:
                             logger.error(f"[AutoTradeEngine] Live order {order_id} for {sym} rejected by broker: {reason}")
                             continue
 
+                    entry_dt = datetime.utcnow()
+                    entry_date_ist = format_ist_date_key(entry_dt)
+                    entry_time_ist = format_ist_datetime(entry_dt)
                     new_pos = {
                         "userId": uid,
                         "symbol": sym,
                         "quantity": qty,
                         "entryPrice": ltp,
+                        "initialStopLossPrice": sl_price,
                         "stopLossPrice": sl_price,
                         "targetPrice": target_price,
                         "highestPrice": ltp,
                         "status": "OPEN",
                         "tradeMode": trade_mode,
                         "aiConfidence": conf,
-                        "entryTime": datetime.utcnow()
+                        "entryTime": entry_dt,
+                        "entryDateIST": entry_date_ist,
+                        "entryTimeIST": entry_time_ist,
+                        "displayDateIST": format_ist_display_date(entry_date_ist),
                     }
                     res = db.autotrade_positions.insert_one(new_pos)
                     new_pos["id"] = str(res.inserted_id)

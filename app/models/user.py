@@ -71,9 +71,67 @@ class User:
         }
 
     @staticmethod
+    def normalize_phone(phone: str) -> str:
+        """Normalize Indian or international phone number to canonical 10-digit string."""
+        if not phone:
+            return ""
+        digits = "".join(ch for ch in str(phone) if ch.isdigit())
+        if len(digits) == 12 and digits.startswith("91"):
+            digits = digits[2:]
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = digits[1:]
+        return digits
+
+    @staticmethod
+    def sanitize_user_doc(user_data: dict) -> dict:
+        """Strip password hashes and any legacy broker secrets from user dictionary."""
+        if not isinstance(user_data, dict):
+            return user_data
+        cleaned = dict(user_data)
+        for forbidden in (
+            "password",
+            "angleClientPin",
+            "angleTotpSecret",
+            "angleApiKey",
+            "angleJwtToken",
+            "angleRefreshToken",
+            "angleFeedToken",
+            "growwApiKey",
+            "growwTotpSecret",
+            "lastRevokedToken",
+        ):
+            cleaned.pop(forbidden, None)
+        return cleaned
+
+    @staticmethod
+    def find_by_phone(phone: str):
+        """Find user by phone number with retry resilience."""
+        norm_phone = User.normalize_phone(phone)
+        if not norm_phone:
+            return None
+        for attempt in range(3):
+            try:
+                database = _get_db()
+                if database is None:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                user_data = database.users.find_one(
+                    {"phone": {"$in": [norm_phone, f"+91{norm_phone}", str(phone).strip()]}}
+                )
+                if not user_data:
+                    return None
+                user_data["_id"] = str(user_data["_id"])
+                user_data["id"] = str(user_data["_id"])
+                return user_data
+            except Exception as e:
+                logger.warning(f"Transient error finding user by phone (attempt {attempt + 1}/3): {e}")
+                time.sleep(0.15 * (attempt + 1))
+        return None
+
+    @staticmethod
     def find_by_email(email):
         """Find user by email with retry resilience"""
-        logger.info(f"email : {email}")
+        logger.info(f"Looking up user by email: {email}")
         for attempt in range(3):
             try:
                 database = _get_db()
@@ -95,13 +153,15 @@ class User:
     def create_user(name, email, password_hash, phone=None):
         """Create a new user in MongoDB"""
         try:
+            norm_phone = User.normalize_phone(phone) if phone else None
             doc = {
                 "name": name,
                 "email": email,
                 "password": password_hash,
-                "phone": phone,
+                "phone": norm_phone,
                 "isAdmin": False,
                 "is_active": True,
+                "activeBroker": "paper",
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }

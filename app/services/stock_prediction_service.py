@@ -104,12 +104,15 @@ class _DataFetcher:
 
     def fetch(self, period: str = "2y") -> pd.DataFrame:
         safe_print(f"  [cyan]Fetching[/cyan] [bold]{self.ticker}[/bold] from Yahoo Finance...")
-        df = yf.download(self.ticker, period=period, auto_adjust=True, progress=False)
-        if df.empty:
+        df = yf.Ticker(self.ticker).history(period=period, auto_adjust=True)
+        if df is None or df.empty:
+            df = yf.download(self.ticker, period=period, auto_adjust=True, progress=False, threads=False)
+        if df is None or df.empty:
             raise ValueError(f"No data returned for {self.ticker}. Check the symbol/exchange.")
-        df.dropna(inplace=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
         safe_print(f"  [green]✓[/green] {len(df)} trading days loaded ({df.index[0].date()} → {df.index[-1].date()})")
         return df
 
@@ -145,10 +148,10 @@ class _DataFetcher:
 class _FeatureEngineer:
     def build(self, df: pd.DataFrame) -> pd.DataFrame:
         d = df.copy()
-        close = d["Close"]
-        high  = d["High"]
-        low   = d["Low"]
-        vol   = d["Volume"]
+        close = d["Close"].squeeze()
+        high  = d["High"].squeeze()
+        low   = d["Low"].squeeze()
+        vol   = d["Volume"].squeeze()
 
         d["EMA_9"]    = ta.trend.ema_indicator(close, window=9)
         d["EMA_20"]   = ta.trend.ema_indicator(close, window=20)
