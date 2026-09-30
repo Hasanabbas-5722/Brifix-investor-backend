@@ -234,25 +234,23 @@ def get_open_fno_positions():
             live_ltp = eff_idx_ltp
 
         highest_prem = max(prev_high, curr_prem)
-        default_init_sl = round(max(entry_prem - 10.0, entry_prem * 0.80), 2)
+        default_init_sl = round(max(entry_prem * 0.75, entry_prem - entry_prem * 0.25), 2)
         sl_prem = float(d.get("stopLossPremium", default_init_sl))
         initial_sl_prem = float(d.get("initialStopLossPremium", min(sl_prem, default_init_sl)))
 
-        raw_gap = entry_prem - initial_sl_prem
-        risk_gap = min(max(raw_gap, 1.0), 10.0) if raw_gap > 0 else 10.0
+        raw_gap = max(entry_prem - initial_sl_prem, entry_prem * 0.15, 5.0)
+        trail_gap = round(max(raw_gap, entry_prem * 0.20, 6.0), 2)
+        gain_from_entry = highest_prem - entry_prem
 
-        if highest_prem > entry_prem:
-            sl_from_entry = round(initial_sl_prem + (highest_prem - entry_prem), 2)
-            sl_prem = max(sl_prem, sl_from_entry)
+        if gain_from_entry >= raw_gap:
+            breakeven_sl = round(entry_prem + max(1.0, entry_prem * 0.015), 2)
+            sl_prem = max(sl_prem, breakeven_sl)
 
-        if highest_prem > prev_high:
-            sl_from_high_step = round(sl_prem + (highest_prem - prev_high), 2)
-            sl_prem = max(sl_prem, sl_from_high_step)
+        if gain_from_entry >= (raw_gap * 1.2):
+            sl_from_trail = round(highest_prem - (trail_gap * 0.75), 2)
+            sl_prem = max(sl_prem, sl_from_trail)
 
-        if curr_prem > prev_curr or curr_prem > entry_prem:
-            sl_from_live_gap = round(curr_prem - risk_gap, 2)
-            if sl_from_live_gap > sl_prem:
-                sl_prem = sl_from_live_gap
+        sl_prem = max(sl_prem, initial_sl_prem)
 
         if (curr_prem != prev_curr) or (highest_prem > prev_high) or (sl_prem > float(d.get("stopLossPremium", 0))):
             try:

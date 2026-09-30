@@ -154,7 +154,7 @@ class FNOAutoTradeEngine:
                 "dailyMaxLoss": 10000.0,
                 "dailyRealizedPnL": 0.0,
                 "maxOpenTrades": 3,
-                "minConfidence": 70.0,
+                "minConfidence": 80.0,
                 "lastResetDate": today_str,
                 "createdAt": datetime.utcnow(),
                 "updatedAt": datetime.utcnow()
@@ -278,7 +278,7 @@ class FNOAutoTradeEngine:
             user_id = pos["userId"]
             qty = max(1, int(pos.get("quantity", 25)))
             entry_prem = float(pos.get("entryPremium", 100.0))
-            default_init_sl = round(max(entry_prem - 10.0, entry_prem * 0.80), 2)
+            default_init_sl = round(max(entry_prem * 0.75, entry_prem - entry_prem * 0.25), 2)
             sl_prem = float(pos.get("stopLossPremium", default_init_sl))
             initial_sl_prem = float(pos.get("initialStopLossPremium", min(sl_prem, default_init_sl)))
             prev_high = float(pos.get("highestPremium", entry_prem))
@@ -291,7 +291,7 @@ class FNOAutoTradeEngine:
                 if entry_time.tzinfo is None:
                     entry_time = entry_time.replace(tzinfo=timezone.utc)
                 age_seconds = (datetime.now(timezone.utc) - entry_time).total_seconds()
-                if age_seconds < 5.0:
+                if age_seconds < 90.0:
                     in_anti_jitter = True
 
             # Resolve real NSE Option Chain premium
@@ -302,21 +302,23 @@ class FNOAutoTradeEngine:
             cfg = self.get_user_config(user_id)
             new_sl = sl_prem
             if cfg.get("trailingStopLoss", True):
-                raw_gap = entry_prem - initial_sl_prem
-                risk_gap = min(max(raw_gap, 1.0), 10.0) if raw_gap > 0 else 10.0
+                # Proportional trailing gap (min 20% of entry premium or initial risk gap)
+                raw_gap = max(entry_prem - initial_sl_prem, entry_prem * 0.15, 5.0)
+                trail_gap = round(max(raw_gap, entry_prem * 0.20, 6.0), 2)
+                gain_from_entry = highest_prem - entry_prem
 
-                if highest_prem > entry_prem:
-                    sl_from_entry = round(initial_sl_prem + (highest_prem - entry_prem), 2)
-                    new_sl = max(new_sl, sl_from_entry)
+                # Step 1: Once option gains +1R (1x initial risk), lock SL at Breakeven + 1 pt so a winner never turns into a loss
+                if gain_from_entry >= raw_gap:
+                    breakeven_sl = round(entry_prem + max(1.0, entry_prem * 0.015), 2)
+                    new_sl = max(new_sl, breakeven_sl)
 
-                if highest_prem > prev_high:
-                    sl_from_high_step = round(sl_prem + (highest_prem - prev_high), 2)
-                    new_sl = max(new_sl, sl_from_high_step)
+                # Step 2: Once option gains > 1.2R, trail behind highest_prem by 0.75 * trail_gap
+                if gain_from_entry >= (raw_gap * 1.2):
+                    sl_from_trail = round(highest_prem - (trail_gap * 0.75), 2)
+                    new_sl = max(new_sl, sl_from_trail)
 
-                if current_prem > prev_curr or current_prem > entry_prem:
-                    sl_from_live_gap = round(current_prem - risk_gap, 2)
-                    if sl_from_live_gap > new_sl:
-                        new_sl = sl_from_live_gap
+                # Never trail below initial SL
+                new_sl = max(new_sl, initial_sl_prem)
 
             profit_target_inr = float(pos.get("profitTargetInr", cfg.get("profitTargetInr", 300.0)))
             target_300_prem = round(entry_prem + (profit_target_inr / qty), 2)
@@ -580,6 +582,31 @@ class FNOAutoTradeEngine:
                 if existing:
                     continue
 
+                # 15-minute re-entry cooldown per underlying after last exit
+                last_closed = db.fno_autotrade_positions.find_one(
+                    {"userId": uid, "underlying": idx_key, "status": "CLOSED"},
+                    sort=[("exitTime", -1)]
+                )
+                if last_closed and last_closed.get("exitTime"):
+                    exit_time = last_closed["exitTime"]
+                    if isinstance(exit_time, datetime) and exit_time.tzinfo is None:
+                        exit_time = exit_time.replace(tzinfo=timezone.utc)
+                    cooldown_elapsed = (datetime.now(timezone.utc) - exit_time).total_seconds()
+                    if cooldown_elapsed < 900:  # 15 minutes = 900 seconds
+                        logger.debug(f"[FNOAutoTradeEngine] Cooldown active for {idx_key}: {int(900 - cooldown_elapsed)}s remaining")
+                        continue
+
+                # Max 2 trades per underlying per day
+                today_str = get_ist_time().strftime("%Y-%m-%d")
+                today_trades_count = db.fno_autotrade_positions.count_documents({
+                    "userId": uid,
+                    "underlying": idx_key,
+                    "entryDateIST": today_str
+                })
+                if today_trades_count >= 2:
+                    logger.debug(f"[FNOAutoTradeEngine] Max 2 trades/day reached for {idx_key} ({today_trades_count} trades today)")
+                    continue
+
                 try:
                     analysis = FNOPredictionService.get_index_analysis(idx_key)
                 except Exception as e:
@@ -646,6 +673,13 @@ class FNOAutoTradeEngine:
                 quantity = lots * lot_size
                 order_cost = round(est_premium * quantity, 2)
 
+                # Check daily loss limit BEFORE entering new trade
+                daily_pnl = float(cfg.get("dailyRealizedPnL", 0.0))
+                daily_max = float(cfg.get("dailyMaxLoss", 10000.0))
+                if daily_pnl <= -daily_max:
+                    logger.info(f"[FNOAutoTradeEngine] Daily loss limit (-₹{daily_max}) already breached for {uid}. No new entries.")
+                    continue
+
                 if avail_cash < order_cost and trade_mode == "live":
                     logger.warning(f"[FNOAutoTradeEngine] Insufficient margin for {uid}: needed {order_cost}, had {avail_cash}")
                     continue
@@ -653,9 +687,18 @@ class FNOAutoTradeEngine:
                 sl_pct = float(cfg.get("stopLossPct", 20.0))
                 profit_target_inr = float(cfg.get("profitTargetInr", 300.0))
 
-                risk_pts = 10.0 if est_premium >= 25.0 else round(est_premium * (sl_pct / 100.0), 2)
-                sl_prem = round(max(est_premium - risk_pts, est_premium * (1.0 - sl_pct / 100.0)), 2)
-                tp_prem = round(est_premium + (profit_target_inr / max(quantity, 1)), 2)
+                # ATR-based dynamic stop-loss (Phase 3 Risk Management)
+                # Use the signal's ATR and delta for intelligent SL sizing
+                sig_atr = float(analysis.get('indicators', {}).get('atr', 85.0))
+                sig_delta = abs(float(analysis.get('greeks', {}).get('delta', 0.50)))
+                atr_risk = max(sig_atr * sig_delta * 1.5, est_premium * 0.15)
+                risk_pts = round(min(atr_risk, est_premium * 0.25), 2)  # Cap at 25% of premium
+                sl_prem = round(max(est_premium - risk_pts, est_premium * 0.75), 2)  # Floor at 75%
+                
+                # Dynamic profit target: 1:2.5 Risk-Reward Ratio
+                rr_target = round(risk_pts * 2.5, 2)
+                tp_prem = round(est_premium + rr_target, 2)
+                profit_target_inr = round(rr_target * quantity, 2)  # Override flat ₹300
 
                 fno_symbol = f"{idx_key} {int(strike)} {opt_type}"
 
@@ -696,6 +739,9 @@ class FNOAutoTradeEngine:
                         "entryIndexPrice": live_idx_ltp,
                         "currentIndexPrice": live_idx_ltp,
                         "delta": delta,
+                        "atr": sig_atr,
+                        "riskPoints": risk_pts,
+                        "trailGap": max(risk_pts, est_premium * 0.30, 25.0),
                         "status": "OPEN",
                         "tradeMode": trade_mode,
                         "aiConfidence": conf,
