@@ -6,7 +6,8 @@ from bson import ObjectId
 from app.utils.logger import get_logger
 from app.models.user import db
 from app.services.broker_service import get_broker_for_user, LiveBrokerError
-from app.services.fno_prediction_service import FNOPredictionService, INDEX_SPECS
+from app.services.fno_prediction_service import FNOPredictionService, INDEX_SPECS, estimate_option_premium, _compute_dte_days
+from app.services.nse_market_service import nse_market_service
 from app.utils.market_calendar import (
     check_market_session,
     format_ist_date_key,
@@ -52,6 +53,52 @@ def resolve_underlying_key(index_symbol: str) -> str:
         return "NIFTY"
 
     return None
+
+
+def resolve_live_option_premium(pos: dict, live_index_ltp: float = 0.0) -> tuple[float, float]:
+    """
+    Resolve the real-time option contract LTP for an open position using:
+      1. Official NSE Option Chain v3 contract LTP (`nse_market_service.get_real_option_quote`)
+      2. Sub-10s micro-tick adjustment from the option chain's underlying snapshot price,
+         strictly guarded against stale/corrupt index jumps.
+    Returns (current_premium, current_index_ltp).
+    """
+    und = pos.get("underlying")
+    strike = float(pos.get("strike", 0.0))
+    opt_type = str(pos.get("optionType", "CE")).upper()
+    expiry = pos.get("expiryDate")
+    entry_prem = float(pos.get("entryPremium", 100.0))
+    prev_curr = float(pos.get("currentPremium", entry_prem))
+    entry_idx = float(pos.get("entryIndexPrice", 0.0))
+    delta = float(pos.get("delta", 0.50))
+
+    # 1. Query Real NSE Option Chain v3
+    try:
+        opt_q = nse_market_service.get_real_option_quote(und, strike, opt_type, expiry=expiry)
+        if opt_q and float(opt_q.get("ltp") or 0.0) > 0:
+            real_opt_ltp = float(opt_q["ltp"])
+            chain_und_ltp = float(opt_q.get("underlying_ltp") or live_index_ltp or entry_idx)
+            eff_idx_ltp = live_index_ltp if live_index_ltp > 0 else chain_und_ltp
+
+            # If live index tick has moved slightly since the 10s option chain snapshot,
+            # apply delta on that small difference only (sanity-checked to < 1.5% index move)
+            if eff_idx_ltp > 0 and chain_und_ltp > 0:
+                micro_idx_diff = eff_idx_ltp - chain_und_ltp
+                if abs(micro_idx_diff) <= (chain_und_ltp * 0.015):
+                    prem_adj = (delta * micro_idx_diff) if opt_type == "CE" else (-delta * micro_idx_diff)
+                    return max(round(real_opt_ltp + prem_adj, 2), 0.5), round(eff_idx_ltp, 2)
+
+            return round(real_opt_ltp, 2), round(eff_idx_ltp, 2)
+    except Exception as e:
+        logger.debug(f"NSE option quote lookup fallback for {und} {strike} {opt_type}: {e}")
+
+    # 2. Fallback: only apply delta if live_index_ltp is genuine and within realistic intraday range (<3%) of entry_idx
+    if live_index_ltp > 0 and entry_idx > 0 and abs(live_index_ltp - entry_idx) <= (entry_idx * 0.03):
+        idx_diff = live_index_ltp - entry_idx
+        prem_diff = delta * idx_diff if opt_type == "CE" else -delta * idx_diff
+        return max(round(entry_prem + prem_diff, 2), 0.5), round(live_index_ltp, 2)
+
+    return round(prev_curr, 2), round(live_index_ltp if live_index_ltp > 0 else entry_idx, 2)
 
 
 class FNOAutoTradeEngine:
@@ -102,7 +149,7 @@ class FNOAutoTradeEngine:
                 "riskRewardRatio": 3.0,
                 "takeProfitPct": 60.0,
                 "profitTargetInr": 300.0,  # Auto Square-Off when Profit reaches ₹300+
-                "strategyName": "VWAP + Supertrend(7,3) + CPR Breakout + PCR OI Confluence",
+                "strategyName": "VWAP + Supertrend(7,3) + CPR Breakout + NSE Option Chain OI",
                 "trailingStopLoss": True,
                 "dailyMaxLoss": 10000.0,
                 "dailyRealizedPnL": 0.0,
@@ -117,7 +164,7 @@ class FNOAutoTradeEngine:
         if "profitTargetInr" not in cfg:
             cfg["profitTargetInr"] = 300.0
         if "strategyName" not in cfg:
-            cfg["strategyName"] = "VWAP + Supertrend(7,3) + CPR Breakout + PCR OI Confluence"
+            cfg["strategyName"] = "VWAP + Supertrend(7,3) + CPR Breakout + NSE Option Chain OI"
 
         # Strictly compute today's realized P&L from closed trades on today's IST date
         today_closed = list(db.fno_autotrade_positions.find({"userId": uid, "status": "CLOSED"}))
@@ -150,7 +197,6 @@ class FNOAutoTradeEngine:
         new_mode = updates.get("tradeMode")
         if new_mode == "live":
             user_doc = db.users.find_one({"_id": ObjectId(uid)}) if ObjectId.is_valid(uid) else None
-            # Validate live broker can be initialized before saving live configuration
             get_broker_for_user(user_doc, user_id=uid, trade_mode="live")
 
         sl = float(updates.get("stopLossPct", 20.0))
@@ -167,7 +213,7 @@ class FNOAutoTradeEngine:
             "stopLossPct": sl,
             "takeProfitPct": tp,
             "profitTargetInr": profit_target_inr,
-            "strategyName": updates.get("strategyName", "VWAP + Supertrend(7,3) + CPR Breakout + PCR OI Confluence"),
+            "strategyName": updates.get("strategyName", "VWAP + Supertrend(7,3) + CPR Breakout + NSE Option Chain OI"),
             "trailingStopLoss": bool(updates.get("trailingStopLoss", True)),
             "dailyMaxLoss": float(updates.get("dailyMaxLoss", 10000.0)),
             "maxOpenTrades": int(updates.get("maxOpenTrades", 3)),
@@ -197,17 +243,12 @@ class FNOAutoTradeEngine:
     def on_index_tick(self, index_symbol: str, index_ltp: float):
         """
         Evaluate all active open F&O positions when an underlying index ticks.
-        Calculates option premium movement via Delta:
-          CE: Delta * (Current Index - Entry Index)
-          PE: -Delta * (Current Index - Entry Index)
-        Applies:
-          1. Smart Point-for-Point Auto Trailing Stop-Loss (Loss & Trailing SL same as before)
-          2. Auto Square-Off when Profit reaches ₹300+ (current_pnl >= profitTargetInr)
+        Uses Real NSE Option Chain v3 contract LTP (`resolve_live_option_premium`)
+        so option positions never experience synthetic jumps.
         """
         if not index_symbol or index_ltp <= 0:
             return
 
-        # Map ticker to underlying key
         underlying_key = resolve_underlying_key(index_symbol)
         if not underlying_key:
             return
@@ -235,11 +276,8 @@ class FNOAutoTradeEngine:
         for pos in open_positions:
             pos_id = pos["_id"]
             user_id = pos["userId"]
-            opt_type = pos.get("optionType", "CE").upper()
             qty = max(1, int(pos.get("quantity", 25)))
             entry_prem = float(pos.get("entryPremium", 100.0))
-            entry_idx = float(pos.get("entryIndexPrice", index_ltp))
-            delta = float(pos.get("delta", 0.50))
             default_init_sl = round(max(entry_prem - 10.0, entry_prem * 0.80), 2)
             sl_prem = float(pos.get("stopLossPremium", default_init_sl))
             initial_sl_prem = float(pos.get("initialStopLossPremium", min(sl_prem, default_init_sl)))
@@ -256,20 +294,11 @@ class FNOAutoTradeEngine:
                 if age_seconds < 5.0:
                     in_anti_jitter = True
 
-            # Option price simulation based on index delta
-            idx_diff = index_ltp - entry_idx
-            if opt_type == "CE":
-                prem_diff = delta * idx_diff
-            else:
-                prem_diff = -delta * idx_diff
-
-            current_prem = max(round(entry_prem + prem_diff, 2), 1.0)
+            # Resolve real NSE Option Chain premium
+            current_prem, eff_index_ltp = resolve_live_option_premium(pos, live_index_ltp=index_ltp)
             highest_prem = max(prev_high, current_prem)
 
-            # Continuous Real-Time Smart Trailing Stop-Loss:
-            # Example: Buy @ 93, SL = 83 (10-pt risk gap).
-            # Tick 93 -> 95 (+2) => SL updates 83 -> 85 in real-time.
-            # Tick 95 -> 98 (+3) => SL updates 85 -> 88 in real-time.
+            # Continuous Real-Time Smart Trailing Stop-Loss
             cfg = self.get_user_config(user_id)
             new_sl = sl_prem
             if cfg.get("trailingStopLoss", True):
@@ -284,8 +313,6 @@ class FNOAutoTradeEngine:
                     sl_from_high_step = round(sl_prem + (highest_prem - prev_high), 2)
                     new_sl = max(new_sl, sl_from_high_step)
 
-                # Real-time live price gap ratchet: whenever price rises (e.g. 93 -> 95 -> 98),
-                # never let SL lag more than risk_gap (10 pts) below current_prem
                 if current_prem > prev_curr or current_prem > entry_prem:
                     sl_from_live_gap = round(current_prem - risk_gap, 2)
                     if sl_from_live_gap > new_sl:
@@ -296,7 +323,6 @@ class FNOAutoTradeEngine:
             target_prem = float(pos.get("targetPremium", target_300_prem))
             current_pnl = round((current_prem - entry_prem) * qty, 2)
 
-            # Update DB with latest premium & real-time smart trailing SL immediately
             db.fno_autotrade_positions.update_one(
                 {"_id": pos_id},
                 {"$set": {
@@ -306,20 +332,18 @@ class FNOAutoTradeEngine:
                     "initialStopLossPremium": initial_sl_prem,
                     "targetPremium": target_prem,
                     "profitTargetInr": profit_target_inr,
-                    "currentIndexPrice": index_ltp
+                    "currentIndexPrice": eff_index_ltp
                 }}
             )
 
-            # Auto Square-Off IMMEDIATELY when Profit is ₹300+ (even during early seconds)
+            # Auto Square-Off IMMEDIATELY when Profit is ₹300+
             if current_pnl >= profit_target_inr or current_prem >= target_prem:
                 self._close_fno_position(pos, current_prem, "PROFIT_300_TARGET_HIT")
                 continue
 
-            # If still within anti-jitter cooldown, allow position to settle (skip premature SL exit)
             if in_anti_jitter:
                 continue
 
-            # Check Stop Loss / Trailing Stop Loss Hit (same as before)
             if current_prem <= new_sl:
                 is_trailing = new_sl > (initial_sl_prem + 0.01)
                 reason = "TRAILING_SL_HIT" if is_trailing else "STOP_LOSS_HIT"
@@ -375,7 +399,6 @@ class FNOAutoTradeEngine:
 
         cfg = self.get_user_config(user_id)
         if cfg.get("dailyRealizedPnL", 0) <= -float(cfg.get("dailyMaxLoss", 10000.0)):
-            # Circuit breaker tripped!
             db.fno_autotrade_configs.update_one(
                 {"userId": user_id},
                 {"$set": {"enabled": False}}
@@ -392,7 +415,7 @@ class FNOAutoTradeEngine:
         open_pos = list(db.fno_autotrade_positions.find({"userId": uid, "status": "OPEN"}))
         closed_count = 0
         for pos in open_pos:
-            curr_prem = float(pos.get("currentPremium", pos.get("entryPremium", 100.0)))
+            curr_prem, _ = resolve_live_option_premium(pos)
             self._close_fno_position(pos, curr_prem, "EMERGENCY_EXIT")
             closed_count += 1
 
@@ -404,7 +427,7 @@ class FNOAutoTradeEngine:
         }
 
     def close_single_fno_position(self, user_id: str, pos_id_str: str, exit_price: float = None) -> dict:
-        """Manually exit a specific open F&O option position at locked/live market price with zero slippage."""
+        """Manually exit a specific open F&O option position at locked/live NSE market price."""
         uid = str(user_id)
         if not ObjectId.is_valid(pos_id_str):
             return {"status": "failed", "error": "Invalid position ID"}
@@ -420,24 +443,16 @@ class FNOAutoTradeEngine:
         if exit_price is not None and float(exit_price) > 0:
             curr_prem = round(float(exit_price), 2)
         else:
-            # Calculate instantaneous live premium from _shared_quotes if available
-            curr_prem = float(pos.get("currentPremium", pos.get("entryPremium", 100.0)))
+            live_ltp = 0.0
             try:
                 from app.socket.indexes import _shared_quotes
                 und = pos.get("underlying")
                 spec = INDEX_SPECS.get(und, {})
                 sym = spec.get("symbol")
                 live_ltp = float((_shared_quotes.get(sym) or {}).get("ltp", 0.0)) if sym else 0.0
-                entry_idx = float(pos.get("entryIndexPrice", 0.0))
-                entry_prem = float(pos.get("entryPremium", 100.0))
-                delta = float(pos.get("delta", 0.50))
-                opt_type = str(pos.get("optionType", "CE")).upper()
-                if live_ltp > 0 and entry_idx > 0:
-                    idx_diff = live_ltp - entry_idx
-                    prem_diff = delta * idx_diff if opt_type == "CE" else -delta * idx_diff
-                    curr_prem = max(round(entry_prem + prem_diff, 2), 1.0)
             except Exception:
                 pass
+            curr_prem, _ = resolve_live_option_premium(pos, live_index_ltp=live_ltp)
 
         self._close_fno_position(pos, curr_prem, "MANUAL_EXIT")
         return {
@@ -462,7 +477,7 @@ class FNOAutoTradeEngine:
                     open_fno = list(db.fno_autotrade_positions.find({"status": "OPEN", "tradeMode": {"$ne": "paper"}}))
                     if open_fno:
                         for pos in open_fno:
-                            curr_prem = float(pos.get("currentPremium") or pos.get("entryPremium", 100.0))
+                            curr_prem, _ = resolve_live_option_premium(pos)
                             self._close_fno_position(pos, curr_prem, "INTRADAY_SQUAREOFF")
                             logger.info(f"[FNOAutoTradeEngine] Live intraday auto square-off executed for {pos.get('symbol')} (15:15 IST cutoff).")
 
@@ -484,7 +499,7 @@ class FNOAutoTradeEngine:
         """
         Evaluate technical signals for Nifty, Bank Nifty, and Fin Nifty,
         screen for high-conviction trades (Conf >= minConfidence),
-        and execute automated F&O options purchases.
+        and execute automated F&O options purchases using REAL NSE Option Chain LTPs.
         """
         uid = str(user_id)
         cfg = self.get_user_config(uid)
@@ -493,7 +508,7 @@ class FNOAutoTradeEngine:
 
         trade_mode = cfg.get("tradeMode", "paper")
 
-        # 1. Update open positions with latest index ticks
+        # 1. Update open positions with latest index ticks & NSE option chain quotes
         open_pos = list(db.fno_autotrade_positions.find({"userId": uid, "status": "OPEN"}))
         from app.socket.indexes import _shared_quotes
 
@@ -501,12 +516,11 @@ class FNOAutoTradeEngine:
             und = pos["underlying"]
             spec = INDEX_SPECS.get(und, {})
             sym = spec.get("symbol")
-            if sym and sym in _shared_quotes:
-                ltp = float(_shared_quotes[sym].get("ltp", 0.0))
-                if ltp > 0:
-                    self.on_index_tick(sym, ltp)
+            ltp = float((_shared_quotes.get(sym) or {}).get("ltp", 0.0)) if sym else 0.0
+            if ltp > 0:
+                self.on_index_tick(sym, ltp)
 
-        # 2. Market session check - strictly enforce 09:15 - 15:15 IST window for ALL trades (live & paper)
+        # 2. Market session check - strictly enforce 09:15 - 15:15 IST window for ALL trades
         is_open, status_code, status_msg = check_market_session()
         if not is_open:
             return {
@@ -577,12 +591,6 @@ class FNOAutoTradeEngine:
                 if sig not in ("CALL_BUY", "PUT_BUY") or conf < min_conf:
                     continue
 
-                qualified_signals.append({
-                    "index": idx_key,
-                    "signal": sig,
-                    "confidence": conf
-                })
-
                 opt_type = "CE" if sig == "CALL_BUY" else "PE"
                 strike_pref = cfg.get("strikePreference", "ATM")
                 strikes = analysis["strikes"]
@@ -593,29 +601,45 @@ class FNOAutoTradeEngine:
                 else:
                     strike = strikes["atm"]
 
-                # Resolve instantaneous live index LTP so entryPremium and entryIndexPrice are 100% synchronized
-                live_idx_ltp = float(analysis.get("current_price", 0.0))
-                try:
-                    from app.socket.indexes import _shared_quotes
-                    spec = INDEX_SPECS.get(idx_key, {})
-                    sym = spec.get("symbol")
-                    if sym and sym in _shared_quotes:
-                        q_ltp = float(_shared_quotes[sym].get("ltp", 0.0))
-                        if q_ltp > 0:
-                            live_idx_ltp = q_ltp
-                except Exception:
-                    pass
+                # Strictly fetch REAL NSE Option Chain contract LTP for this exact strike & option type
+                real_opt_q = nse_market_service.get_real_option_quote(
+                    idx_key, strike, opt_type, expiry=analysis.get("expiry")
+                )
+                if not real_opt_q or float(real_opt_q.get("ltp") or 0.0) < 2.0:
+                    logger.warning(
+                        f"[FNOAutoTradeEngine] Skipping {idx_key} {strike} {opt_type}: "
+                        f"real NSE Option Chain LTP unavailable or illiquid ({real_opt_q})"
+                    )
+                    continue
 
-                # Estimate or lookup option premium at live_idx_ltp
-                from app.services.fno_prediction_service import estimate_option_premium
+                est_premium = round(float(real_opt_q["ltp"]), 2)
+                expiry_str = real_opt_q.get("expiry") or analysis.get("expiry") or ""
+                live_idx_ltp = float(real_opt_q.get("underlying_ltp") or analysis.get("current_price") or 0.0)
+                if live_idx_ltp <= 0:
+                    continue
+
+                raw_iv = float(real_opt_q.get("iv") or 0.0)
+                iv_decimal = (raw_iv / 100.0) if raw_iv > 1.0 else INDEX_SPECS.get(idx_key, {}).get("base_iv", 0.14)
+
                 live_pricing = estimate_option_premium(
-                    live_idx_ltp if live_idx_ltp > 0 else float(analysis.get("current_price", 23000.0)),
+                    live_idx_ltp,
                     strike,
                     opt_type,
-                    iv=INDEX_SPECS.get(idx_key, {}).get("base_iv", 0.14),
+                    dte_days=_compute_dte_days(expiry_str),
+                    iv=iv_decimal,
+                    real_ltp=est_premium,
                 )
-                est_premium = live_pricing["premium"]
                 delta = abs(live_pricing["delta"])
+
+                qualified_signals.append({
+                    "index": idx_key,
+                    "signal": sig,
+                    "confidence": conf,
+                    "strike": strike,
+                    "option_type": opt_type,
+                    "real_nse_ltp": est_premium,
+                    "expiry": expiry_str,
+                })
 
                 lots = max(1, int(cfg.get("lotsPerTrade", 1)))
                 lot_size = analysis["lot_size"]
@@ -626,8 +650,6 @@ class FNOAutoTradeEngine:
                     logger.warning(f"[FNOAutoTradeEngine] Insufficient margin for {uid}: needed {order_cost}, had {avail_cash}")
                     continue
 
-                # Tight 10-point initial SL (e.g. Buy @ 93 -> SL = 83) + Real-Time Continuous Trailing SL;
-                # Profit Target is set to auto square-off when Profit reaches ₹300+!
                 sl_pct = float(cfg.get("stopLossPct", 20.0))
                 profit_target_inr = float(cfg.get("profitTargetInr", 300.0))
 
@@ -659,6 +681,8 @@ class FNOAutoTradeEngine:
                         "underlying": idx_key,
                         "optionType": opt_type,
                         "strike": strike,
+                        "expiryDate": expiry_str,
+                        "isRealNseLtp": True,
                         "lots": lots,
                         "lotSize": lot_size,
                         "quantity": quantity,
@@ -676,7 +700,7 @@ class FNOAutoTradeEngine:
                         "tradeMode": trade_mode,
                         "aiConfidence": conf,
                         "signal": sig,
-                        "strategyName": analysis.get("strategy_name", "VWAP + Supertrend(7,3) + CPR Breakout + PCR OI Confluence"),
+                        "strategyName": analysis.get("strategy_name", "VWAP + Supertrend(7,3) + CPR Breakout + NSE Option Chain OI"),
                         "entryReasons": analysis.get("entry_reasons", []),
                         "entryTime": now_utc,
                         "entryDateIST": entry_date_ist,
@@ -692,9 +716,9 @@ class FNOAutoTradeEngine:
                     open_count += 1
                     avail_cash -= order_cost
                     logger.info(
-                        f"[FNOAutoTradeEngine] Executed Auto F&O BUY for {uid}: {lots} lot(s) ({quantity} qty) "
-                        f"{fno_symbol} @ Premium Rs.{est_premium} (AI Conf: {conf}%) | "
-                        f"SL: Rs.{sl_prem} (-{sl_pct}%) | Auto Target: Rs.{tp_prem} (+Rs.{profit_target_inr} Profit)"
+                        f"[FNOAutoTradeEngine] Executed Real NSE Auto F&O BUY for {uid}: {lots} lot(s) ({quantity} qty) "
+                        f"{fno_symbol} ({expiry_str}) @ Real NSE LTP Rs.{est_premium} (AI Conf: {conf}%) | "
+                        f"SL: Rs.{sl_prem} | Auto Target: Rs.{tp_prem} (+Rs.{profit_target_inr} Profit)"
                     )
             finally:
                 with _fno_order_locks_mutex:

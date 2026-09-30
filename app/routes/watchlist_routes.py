@@ -1,8 +1,8 @@
 """
-Watchlist Routes
-================
-Provides live quotes, symbol management, and multi-watchlist support.
-GET  /api/v1/watchlist           -> Returns watchlist with live prices, change %, day high/low
+Watchlist Routes (Real NSE Edition)
+===================================
+Provides live NSE quotes, symbol management, and multi-watchlist support.
+GET  /api/v1/watchlist           -> Returns watchlist with real NSE prices, change %, day high/low
 POST /api/v1/watchlist/add       -> Add a stock to user's watchlist
 POST /api/v1/watchlist/remove    -> Remove a stock from watchlist
 GET  /api/v1/watchlist/search    -> Search stocks / indices to add
@@ -10,15 +10,14 @@ GET  /api/v1/watchlist/search    -> Search stocks / indices to add
 
 import time
 from flask import Blueprint, request, jsonify
-import yfinance as yf
 from app.utils.logger import get_logger
 from app.extensions import connect_to_mongodb
+from app.services.nse_market_service import nse_market_service
 
 logger = get_logger(__name__)
 
 watchlist_bp = Blueprint("watchlist", __name__, url_prefix="/api/v1")
 
-# Symbol to Yahoo ticker map
 SYMBOL_MAP = {
     'NIFTY 50': '^NSEI',
     'NIFTY50': '^NSEI',
@@ -84,7 +83,6 @@ DEFAULT_STOCKS = [
     'ICICIBANK', 'INFY', 'BHARTIARTL', 'TATAMOTORS'
 ]
 
-# Cache quotes for 5 seconds to provide blazing fast response
 _QUOTE_CACHE = {}
 CACHE_TTL = 5.0
 
@@ -96,6 +94,19 @@ def _resolve_ticker(sym: str) -> str:
     if not s.endswith('.NS') and not s.endswith('.BO') and not s.startswith('^'):
         return f"{s}.NS"
     return s
+
+
+def _build_sparkline(prev_p: float, open_p: float, low_p: float, high_p: float, ltp: float) -> list:
+    if ltp <= 0:
+        return []
+    p = prev_p if prev_p > 0 else ltp
+    o = open_p if open_p > 0 else p
+    l = low_p if low_p > 0 else min(o, ltp)
+    h = high_p if high_p > 0 else max(o, ltp)
+    mid1 = round((o + l) / 2.0, 2) if ltp >= o else round((o + h) / 2.0, 2)
+    mid2 = round((l + h) / 2.0, 2)
+    mid3 = round((h + ltp) / 2.0, 2) if ltp >= o else round((l + ltp) / 2.0, 2)
+    return [round(p, 2), round(o, 2), mid1, round(l if ltp >= o else h, 2), mid2, mid3, round(ltp, 2)]
 
 
 def _fetch_quotes(symbols: list) -> list:
@@ -112,77 +123,66 @@ def _fetch_quotes(symbols: list) -> list:
             to_fetch.append(clean)
 
     if to_fetch:
-        ticker_map = {s: _resolve_ticker(s) for s in to_fetch}
-        tickers_list = list(set(ticker_map.values()))
+        indices_map = {}
+        stocks_map = {}
+        try:
+            indices_map = nse_market_service.fetch_live_indices() or {}
+        except Exception as e:
+            logger.debug(f"Watchlist indices fetch error: {e}")
 
         try:
-            # Batch download 5-day data for quotes and sparkline
-            data = yf.download(
-                tickers_list,
-                period="5d",
-                interval="1d",
-                progress=False,
-                group_by="ticker",
-                auto_adjust=True
+            stocks_map, _, _ = nse_market_service.fetch_live_stocks_and_movers(required_symbols=to_fetch)
+            stocks_map = stocks_map or {}
+        except Exception as e:
+            logger.debug(f"Watchlist stocks fetch error: {e}")
+
+        from app.socket.indexes import _shared_quotes
+
+        for sym in to_fetch:
+            ytick = _resolve_ticker(sym)
+            q = (
+                indices_map.get(sym)
+                or indices_map.get(ytick)
+                or stocks_map.get(sym)
+                or stocks_map.get(ytick)
+                or _shared_quotes.get(ytick)
+                or _shared_quotes.get(sym)
             )
+            if not q or float(q.get("ltp") or 0) <= 0:
+                q = nse_market_service.fetch_single_equity_quote(sym)
 
-            for sym in to_fetch:
-                ytick = ticker_map[sym]
-                try:
-                    df = data[ytick].dropna() if ytick in data else None
-                    if df is not None and not df.empty:
-                        last_row = df.iloc[-1]
-                        prev_row = df.iloc[-2] if len(df) > 1 else last_row
+            if q and float(q.get("ltp") or 0) > 0:
+                ltp = round(float(q.get("ltp") or 0.0), 2)
+                prev = round(float(q.get("prev") or ltp), 2)
+                chg = round(float(q.get("change") if q.get("change") is not None else (ltp - prev)), 2)
+                chg_pct = round(
+                    float(q.get("changePercent") if q.get("changePercent") is not None else ((chg / prev * 100.0) if prev > 0 else 0.0)),
+                    2
+                )
+                high_p = round(float(q.get("high") or ltp), 2)
+                low_p = round(float(q.get("low") or ltp), 2)
+                open_p = round(float(q.get("open") or prev), 2)
+                vol = int(q.get("vol") or 0)
 
-                        close = round(float(last_row['Close']), 2)
-                        prev_close = round(float(prev_row['Close']), 2)
-                        chg = round(close - prev_close, 2)
-                        chg_pct = round((chg / prev_close) * 100, 2) if prev_close else 0.0
-
-                        sparkline = [round(float(c), 2) for c in df['Close'].tail(7).tolist()]
-
-                        item = {
-                            "symbol": sym,
-                            "ticker": ytick,
-                            "name": COMPANY_NAMES.get(sym, sym),
-                            "price": close,
-                            "change": chg,
-                            "change_pct": chg_pct,
-                            "high": round(float(last_row['High']), 2),
-                            "low": round(float(last_row['Low']), 2),
-                            "open": round(float(last_row['Open']), 2),
-                            "volume": int(last_row['Volume']) if 'Volume' in last_row else 0,
-                            "sparkline": sparkline,
-                            "is_index": sym.startswith('^') or 'NIFTY' in sym or 'SENSEX' in sym,
-                            "updated_at": int(now)
-                        }
-                        _QUOTE_CACHE[sym] = {'time': now, 'data': item}
-                        results.append(item)
-                        continue
-                except Exception as e:
-                    logger.warning(f"Error parsing quote for {sym}: {e}")
-
-                # Fallback item if symbol fetch fails
-                fallback = {
+                item = {
                     "symbol": sym,
                     "ticker": ytick,
-                    "name": COMPANY_NAMES.get(sym, sym),
-                    "price": 0.0,
-                    "change": 0.0,
-                    "change_pct": 0.0,
-                    "high": 0.0,
-                    "low": 0.0,
-                    "open": 0.0,
-                    "volume": 0,
-                    "sparkline": [],
-                    "is_index": False,
+                    "name": COMPANY_NAMES.get(sym) or q.get("name") or sym,
+                    "price": ltp,
+                    "change": chg,
+                    "change_pct": chg_pct,
+                    "high": high_p,
+                    "low": low_p,
+                    "open": open_p,
+                    "volume": vol,
+                    "sparkline": _build_sparkline(prev, open_p, low_p, high_p, ltp),
+                    "is_index": sym.startswith('^') or 'NIFTY' in sym or 'SENSEX' in sym,
+                    "source": "NSE_LIVE",
                     "updated_at": int(now)
                 }
-                results.append(fallback)
-        except Exception as e:
-            logger.error(f"Batch quote download failed: {e}")
+                _QUOTE_CACHE[sym] = {'time': now, 'data': item}
+                results.append(item)
 
-    # Maintain original symbol order
     order_dict = {s.upper(): idx for idx, s in enumerate(symbols)}
     results.sort(key=lambda x: order_dict.get(x["symbol"], 999))
     return results
@@ -191,12 +191,6 @@ def _fetch_quotes(symbols: list) -> list:
 @watchlist_bp.route("/watchlist", methods=["GET"])
 @watchlist_bp.route("/watchlist/list", methods=["GET"])
 def get_watchlist():
-    """
-    Returns user's watchlist stocks with live market quotes and sparkline trends.
-    Query params:
-        email (str, optional)
-        tab   (str, optional) e.g. 'Main', 'Tech'
-    """
     email = request.args.get("email")
     tab = request.args.get("tab", "Main").strip()
 
@@ -223,13 +217,6 @@ def get_watchlist():
 
 @watchlist_bp.route("/watchlist/add", methods=["POST"])
 def add_to_watchlist():
-    """
-    Adds a stock to user's watchlist.
-    JSON Body:
-        symbol (str, required)
-        email  (str, optional)
-        tab    (str, optional)
-    """
     data = request.get_json(silent=True) or {}
     symbol = data.get("symbol", "").strip().upper()
     email = data.get("email", "").strip()
@@ -250,7 +237,6 @@ def add_to_watchlist():
         except Exception as e:
             logger.error(f"Error adding to watchlist DB: {e}")
 
-    # Fetch live quote for the added symbol
     single_quote = _fetch_quotes([symbol])
     return jsonify({
         "status": "success",
@@ -261,13 +247,6 @@ def add_to_watchlist():
 
 @watchlist_bp.route("/watchlist/remove", methods=["POST"])
 def remove_from_watchlist():
-    """
-    Removes a stock from user's watchlist.
-    JSON Body:
-        symbol (str, required)
-        email  (str, optional)
-        tab    (str, optional)
-    """
     data = request.get_json(silent=True) or {}
     symbol = data.get("symbol", "").strip().upper()
     email = data.get("email", "").strip()
@@ -295,10 +274,6 @@ def remove_from_watchlist():
 
 @watchlist_bp.route("/watchlist/search", methods=["GET"])
 def search_symbols():
-    """
-    Searches available stocks and indices to add to watchlist.
-    Query param: q (str)
-    """
     q = request.args.get("q", "").strip().upper()
     all_symbols = list(COMPANY_NAMES.keys())
 

@@ -172,135 +172,74 @@ def is_nse_market_open() -> bool:
     """Check if Indian NSE market is currently in normal trading session (09:15 - 15:30 IST, Mon-Fri)."""
     return bool(get_market_session_info().get("is_open", False))
 
-DEFAULT_SEED_QUOTES = {
-    "^NSEI": {'ltp': 23320.30, 'prev': 23118.60, 'open': 23150.00, 'high': 23350.00, 'low': 23100.00, 'vol': 550000},
-    "^NSEBANK": {'ltp': 56205.10, 'prev': 55794.75, 'open': 55800.00, 'high': 56250.00, 'low': 55700.00, 'vol': 380000},
-    "^BSESN": {'ltp': 74360.00, 'prev': 74003.80, 'open': 74100.00, 'high': 74550.00, 'low': 73950.00, 'vol': 250000},
-    "NIFTY_FIN_SERVICE.NS": {'ltp': 25419.90, 'prev': 25076.65, 'open': 25080.00, 'high': 25450.00, 'low': 25020.00, 'vol': 180000},
-    "RELIANCE.NS": {'ltp': 1251.00, 'prev': 1235.30, 'open': 1240.00, 'high': 1260.00, 'low': 1230.00, 'vol': 150000},
-    "TCS.NS": {'ltp': 2236.00, 'prev': 2251.00, 'open': 2245.00, 'high': 2265.00, 'low': 2225.00, 'vol': 110000},
-    "HDFCBANK.NS": {'ltp': 716.30, 'prev': 716.55, 'open': 717.00, 'high': 722.00, 'low': 714.00, 'vol': 280000},
-    "INFY.NS": {'ltp': 1080.30, 'prev': 1077.00, 'open': 1078.00, 'high': 1090.00, 'low': 1072.00, 'vol': 190000},
-    "ICICIBANK.NS": {'ltp': 1351.60, 'prev': 1350.40, 'open': 1350.00, 'high': 1362.00, 'low': 1345.00, 'vol': 220000},
-    "SBIN.NS": {'ltp': 979.70, 'prev': 968.00, 'open': 970.00, 'high': 988.00, 'low': 965.00, 'vol': 340000},
-    "BHARTIARTL.NS": {'ltp': 1824.20, 'prev': 1830.40, 'open': 1830.00, 'high': 1845.00, 'low': 1815.00, 'vol': 130000},
-    "ITC.NS": {'ltp': 262.15, 'prev': 258.00, 'open': 259.00, 'high': 265.00, 'low': 256.00, 'vol': 410000},
-    "AXISBANK.NS": {'ltp': 1234.50, 'prev': 1222.90, 'open': 1225.00, 'high': 1245.00, 'low': 1220.00, 'vol': 210000},
-    "BAJFINANCE.NS": {'ltp': 1011.90, 'prev': 1009.20, 'open': 1010.00, 'high': 1025.00, 'low': 1005.00, 'vol': 85000},
-    "WIPRO.NS": {'ltp': 169.10, 'prev': 170.00, 'open': 170.00, 'high': 173.00, 'low': 167.00, 'vol': 175000},
-    "SUNPHARMA.NS": {'ltp': 1851.30, 'prev': 1835.00, 'open': 1838.00, 'high': 1865.00, 'low': 1830.00, 'vol': 95000},
-    "MARUTI.NS": {'ltp': 12328.00, 'prev': 12231.00, 'open': 12250.00, 'high': 12450.00, 'low': 12200.00, 'vol': 65000},
-    "ADANIENT.NS": {'ltp': 2931.70, 'prev': 2928.60, 'open': 2930.00, 'high': 2960.00, 'low': 2910.00, 'vol': 140000},
-    "LT.NS": {'ltp': 3827.80, 'prev': 3850.70, 'open': 3850.00, 'high': 3880.00, 'low': 3810.00, 'vol': 88000},
-    "KOTAKBANK.NS": {'ltp': 410.20, 'prev': 409.80, 'open': 410.00, 'high': 416.00, 'low': 407.00, 'vol': 160000},
-}
+# Zero hardcoded static seed quotes — populated strictly from real NSE India live APIs
+DEFAULT_SEED_QUOTES = {}
 
-_shared_quotes = dict(DEFAULT_SEED_QUOTES)
+_shared_quotes = {}
 _quotes_lock = threading.Lock()
 
+
+def refresh_shared_quotes_from_nse(max_age_sec: float = 2.5) -> dict:
+    """
+    Synchronously or asynchronously refresh `_shared_quotes` from official NSE India APIs
+    (`allIndices`, `live-analysis-variations`, `GetQuoteApi`).
+    Contains ZERO random drift or static seed prices.
+    """
+    from app.services.nse_market_service import nse_market_service
+
+    try:
+        live_indices = nse_market_service.fetch_live_indices(max_age_sec=max_age_sec)
+        required_syms = [s[1] for s in CORE_STOCKS]
+        with _dynamic_lock:
+            for dyn_sym in list(_dynamic_symbols):
+                clean = dyn_sym.replace(".NS", "").strip().upper()
+                if clean and not clean.startswith("^") and clean not in required_syms:
+                    required_syms.append(clean)
+
+        live_stocks, _, _ = nse_market_service.fetch_live_stocks_and_movers(
+            required_symbols=required_syms,
+            max_age_sec=max_age_sec,
+        )
+
+        with _quotes_lock:
+            for k, v in live_indices.items():
+                if v and float(v.get("ltp", 0)) > 0:
+                    _shared_quotes[k] = dict(v)
+            for k, v in live_stocks.items():
+                if v and float(v.get("ltp", 0)) > 0:
+                    _shared_quotes[k] = dict(v)
+                    if not k.endswith(".NS"):
+                        _shared_quotes[f"{k}.NS"] = dict(v)
+    except Exception as e:
+        logger.debug(f"[refresh_shared_quotes_from_nse] warning: {e}")
+
+    with _quotes_lock:
+        return dict(_shared_quotes)
+
+
 def _run_quote_updater():
-    """Background worker that periodically refreshes quotes from Yahoo Finance without blocking the broadcaster."""
-    import yfinance as yf
-    import time
-    logger.info("Starting background Yahoo Finance quote updater...")
+    """Background worker that refreshes real NSE India quotes every 3 seconds."""
+    logger.info("Starting real-time NSE India market quote updater...")
     while _fallback_feeder_running:
         try:
-            targets = list(INDEX_TARGETS) + [(s[0], s[1], s[2]) for s in CORE_STOCKS]
-            with _dynamic_lock:
-                for dyn_sym in list(_dynamic_symbols):
-                    ticker = dyn_sym if (dyn_sym.startswith('^') or dyn_sym.endswith('.NS')) else f"{dyn_sym}.NS"
-                    if not any(s[0] == ticker for s in targets):
-                        targets.append((ticker, dyn_sym, dyn_sym))
-
-            tickers_list = list({t[0] for t in targets})
-            try:
-                data = yf.download(
-                    tickers_list,
-                    period="5d",
-                    interval="1d",
-                    progress=False,
-                    group_by="ticker",
-                    auto_adjust=True,
-                )
-                for ticker_sym, token_id, display_name in targets:
-                    try:
-                        df = data[ticker_sym].dropna() if ticker_sym in data else None
-                        if df is not None and not df.empty:
-                            last_row = df.iloc[-1]
-                            prev_row = df.iloc[-2] if len(df) > 1 else last_row
-                            ltp = round(float(last_row['Close']), 2)
-                            prev = round(float(prev_row['Close']), 2)
-                            open_p = round(float(last_row['Open']), 2)
-                            day_h = round(float(last_row['High']), 2)
-                            day_l = round(float(last_row['Low']), 2)
-                            vol = int(last_row['Volume']) if 'Volume' in last_row else 1000
-                            if ltp > 0:
-                                with _quotes_lock:
-                                    existing = _shared_quotes.get(ticker_sym, {})
-                                    last_yf = existing.get('last_yf_ltp')
-                                    # Only overwrite live drifted ltp if Yahoo Finance reported a genuinely new price
-                                    resolved_ltp = ltp if (last_yf != ltp or not existing.get('ltp')) else existing['ltp']
-                                    _shared_quotes[ticker_sym] = {
-                                        'ltp': resolved_ltp,
-                                        'last_yf_ltp': ltp,
-                                        'prev': prev if prev > 0 else resolved_ltp,
-                                        'open': open_p if open_p > 0 else resolved_ltp,
-                                        'high': max(day_h, resolved_ltp, existing.get('high', day_h)),
-                                        'low': min(day_l if day_l > 0 else resolved_ltp, resolved_ltp, existing.get('low', day_l if day_l > 0 else resolved_ltp)),
-                                        'vol': vol,
-                                    }
-                    except Exception:
-                        pass
-            except Exception as batch_err:
-                logger.debug(f"Batch quote download fallback: {batch_err}")
-                for ticker_sym, token_id, display_name in targets:
-                    if not _fallback_feeder_running:
-                        break
-                    try:
-                        t_obj = yf.Ticker(ticker_sym)
-                        f = t_obj.fast_info
-                        ltp = float(getattr(f, 'last_price', None) or f.get('lastPrice', 0) or 0)
-                        if ltp > 0:
-                            prev = float(getattr(f, 'previous_close', None) or f.get('previousClose', 0) or ltp)
-                            open_p = float(getattr(f, 'open', None) or f.get('open', 0) or ltp)
-                            day_h = float(getattr(f, 'day_high', None) or f.get('dayHigh', 0) or ltp)
-                            day_l = float(getattr(f, 'day_low', None) or f.get('dayLow', 0) or ltp)
-                            vol = int(getattr(f, 'last_volume', None) or f.get('lastVolume', 0) or 1000)
-                            with _quotes_lock:
-                                existing = _shared_quotes.get(ticker_sym, {})
-                                last_yf = existing.get('last_yf_ltp')
-                                resolved_ltp = round(ltp, 2) if (last_yf != round(ltp, 2) or not existing.get('ltp')) else existing['ltp']
-                                _shared_quotes[ticker_sym] = {
-                                    'ltp': resolved_ltp,
-                                    'last_yf_ltp': round(ltp, 2),
-                                    'prev': round(prev, 2),
-                                    'open': round(open_p, 2),
-                                    'high': round(max(day_h, resolved_ltp), 2),
-                                    'low': round(min(day_l, resolved_ltp), 2),
-                                    'vol': vol,
-                                }
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
+            refresh_shared_quotes_from_nse(max_age_sec=2.5)
         except Exception as e:
-            logger.debug(f"Quote updater error: {e}")
-        time.sleep(8)
+            logger.debug(f"NSE quote updater error: {e}")
+        time.sleep(3.0)
+
 
 def _run_index_feeder():
-    """Ultra-responsive tick broadcaster emitting every 1s without network blocking."""
+    """Real-time NSE tick broadcaster emitting authentic NSE prices every 1s with zero synthetic drift."""
     global _fallback_feeder_running
     import eventlet
-    import math
     from app.services.realtime_candle_manager import realtime_candle_manager
 
-    logger.info("Starting ultra-responsive real-time market broadcaster (1s cadence)...")
+    logger.info("Starting real-time NSE market broadcaster (1s cadence, zero synthetic drift)...")
 
     try:
         status_emit_counter = 0
-        tick_seq = 0
         while _fallback_feeder_running:
             try:
-                tick_seq += 1
                 session_info = get_market_session_info()
                 is_market_open = session_info.get("is_open", False)
 
@@ -309,6 +248,12 @@ def _run_index_feeder():
                 if status_emit_counter >= 5:
                     status_emit_counter = 0
                     socketio.emit("market_status", session_info, room='indexes')
+
+                with _quotes_lock:
+                    current_quotes = dict(_shared_quotes)
+
+                if not current_quotes:
+                    current_quotes = refresh_shared_quotes_from_nse(max_age_sec=2.5)
 
                 # Build target list
                 stock_list = list(CORE_STOCKS)
@@ -321,41 +266,23 @@ def _run_index_feeder():
                 all_targets = [(t[0], t[1], t[2], True) for t in INDEX_TARGETS] + [(s[0], s[1], s[2], False) for s in stock_list]
 
                 stock_movers = []
-
-                with _quotes_lock:
-                    current_quotes = dict(_shared_quotes)
-
                 now_ts = time.time()
 
-                for idx_i, (ticker_sym, token_id, display_name, is_index) in enumerate(all_targets):
-                    q = current_quotes.get(ticker_sym)
+                for ticker_sym, token_id, display_name, is_index in all_targets:
+                    q = current_quotes.get(ticker_sym) or current_quotes.get(token_id) or current_quotes.get(display_name)
                     if not q:
                         continue
 
-                    ltp = q['ltp']
-                    prev = q['prev']
-                    open_p = q['open']
-                    day_h = q['high']
-                    day_l = q['low']
-
-                    # Apply trend-aligned institutional momentum micro-ticks during open market session
-                    if is_market_open:
-                        intraday_bull = ltp >= open_p and ltp >= prev
-                        trend_bias = 1.0 if intraday_bull else -1.0
-                        # Smooth impulse + minor pullback cycle aligned with the prevailing VWAP/Supertrend direction
-                        wave = math.sin((tick_seq * 0.35) + idx_i) * 0.45
-                        step_factor = (0.55 * trend_bias + wave) * 0.00012
-                        ltp = round(ltp * (1.0 + step_factor), 2)
-                        day_h = max(day_h, ltp)
-                        day_l = min(day_l, ltp)
-
-                        # Update shared quote with new tick
-                        q['ltp'] = ltp
-                        q['high'] = day_h
-                        q['low'] = day_l
+                    ltp = float(q.get('ltp') or 0.0)
+                    if ltp <= 0:
+                        continue
+                    prev = float(q.get('prev') or ltp)
+                    open_p = float(q.get('open') or prev)
+                    day_h = float(q.get('high') or max(ltp, open_p))
+                    day_l = float(q.get('low') or min(ltp, open_p))
 
                     change = round(ltp - prev, 2)
-                    p_change = round((change / prev * 100), 2) if prev > 0 else 0.0
+                    p_change = round((change / prev * 100.0), 2) if prev > 0 else 0.0
 
                     tick_payload = {
                         "token": token_id,
@@ -370,6 +297,7 @@ def _run_index_feeder():
                         "prevClose": round(prev, 2),
                         "is_market_open": is_market_open,
                         "market_status": session_info.get("status", "CLOSED"),
+                        "source": "NSE_LIVE",
                         "full_data": {
                             "last_traded_price": round(ltp * 100),
                             "closed_price": round(prev * 100),
@@ -401,12 +329,12 @@ def _run_index_feeder():
                             socketio.emit("stock_price", tick_payload, room=f"chart_{token_id}_1d")
 
                     # Feed real-time candle manager across all symbol aliases for sub-second chart updates
-                    realtime_candle_manager.process_tick(token_id, ltp, 1000, now_ts)
+                    realtime_candle_manager.process_tick(token_id, ltp, int(q.get('vol') or 1000), now_ts)
                     if display_name != token_id:
-                        realtime_candle_manager.process_tick(display_name, ltp, 1000, now_ts)
+                        realtime_candle_manager.process_tick(display_name, ltp, int(q.get('vol') or 1000), now_ts)
                         compact_name = display_name.replace(" ", "")
                         if compact_name != display_name:
-                            realtime_candle_manager.process_tick(compact_name, ltp, 1000, now_ts)
+                            realtime_candle_manager.process_tick(compact_name, ltp, int(q.get('vol') or 1000), now_ts)
 
                     # Feed tick into autotrade worker queue when market is open
                     if is_market_open:
@@ -425,13 +353,13 @@ def _run_index_feeder():
             except Exception as e:
                 logger.error(f"Error in broadcaster: {e}")
 
-            # Always maintain 1.0s real-time cadence so connected clients never experience >1s delay
             eventlet.sleep(1.0)
     finally:
         _fallback_feeder_running = False
 
+
 def ensure_index_feeder():
-    """Ensure both the index feeder, quote updater, and real-time candle manager are running."""
+    """Ensure both the index feeder, real NSE quote updater, and real-time candle manager are running."""
     global _fallback_feeder_running, _tick_eval_worker_started
     from app.services.realtime_candle_manager import realtime_candle_manager
     realtime_candle_manager.init_socketio(socketio)
@@ -445,6 +373,9 @@ def ensure_index_feeder():
 
         if not _fallback_feeder_running:
             _fallback_feeder_running = True
+            # Start quote updater in background thread immediately
+            t_up = threading.Thread(target=_run_quote_updater, daemon=True)
+            t_up.start()
             # Start broadcaster in eventlet greenlet
             try:
                 import eventlet
@@ -452,9 +383,6 @@ def ensure_index_feeder():
             except Exception:
                 t = threading.Thread(target=_run_index_feeder, daemon=True)
                 t.start()
-            # Start quote updater in background thread
-            t_up = threading.Thread(target=_run_quote_updater, daemon=True)
-            t_up.start()
 
 
 @socketio.on('connect')
@@ -513,9 +441,11 @@ def handle_subscribe_indexes(data=None):
     # Immediately push current quotes for all indices, stocks, gainers & losers (0ms initial latency)
     with _quotes_lock:
         current_quotes = dict(_shared_quotes)
+    if not current_quotes:
+        current_quotes = refresh_shared_quotes_from_nse(max_age_sec=2.5)
 
     for ticker_sym, token_id, display_name in INDEX_TARGETS:
-        q = current_quotes.get(ticker_sym)
+        q = current_quotes.get(ticker_sym) or current_quotes.get(token_id) or current_quotes.get(display_name)
         if q:
             ltp = q['ltp']
             prev = q['prev']

@@ -164,10 +164,42 @@ def update_fno_config():
     })
 
 
+@fno_bp.route("/option-chain", methods=["GET"])
+def get_fno_option_chain():
+    """Returns real-time NSE Option Chain v3 (PCR, Max Pain, Expiry, Strikes CE/PE LTP, OI, IV)."""
+    index_key = (request.args.get("symbol") or request.args.get("index") or "NIFTY").strip().upper()
+    expiry = request.args.get("expiry")
+    try:
+        from app.services.nse_market_service import nse_market_service
+        chain = nse_market_service.get_index_option_chain(index_key, expiry=expiry)
+        if not chain:
+            return jsonify({"status": "failed", "error": f"Option chain unavailable for {index_key}"}), 503
+        # Convert integer strike keys to string for JSON serialization
+        serialized_strikes = {str(k): v for k, v in (chain.get("strikes") or {}).items()}
+        return jsonify({
+            "status": "success",
+            "index": chain.get("index"),
+            "underlying_ltp": chain.get("underlying_ltp"),
+            "expiry": chain.get("expiry"),
+            "expiry_dates": chain.get("expiry_dates", []),
+            "atm_strike": chain.get("atm_strike"),
+            "strike_step": chain.get("strike_step"),
+            "pcr": chain.get("pcr"),
+            "max_pain": chain.get("max_pain"),
+            "total_ce_oi": chain.get("total_ce_oi"),
+            "total_pe_oi": chain.get("total_pe_oi"),
+            "strikes": serialized_strikes,
+            "updated_at": chain.get("updated_at"),
+        })
+    except Exception as e:
+        logger.error(f"[get_fno_option_chain] Error: {e}")
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+
 @fno_bp.route("/positions", methods=["GET"])
 @validate_access_token
 def get_open_fno_positions():
-    """Fetch currently active open F&O option positions with real-time premium & P&L."""
+    """Fetch currently active open F&O option positions with real-time NSE Option Chain premium & P&L."""
     uid = _get_uid()
     if not uid:
         return jsonify({"status": "failed", "error": "Unauthorized"}), 401
@@ -175,6 +207,7 @@ def get_open_fno_positions():
     # Strictly READ-ONLY: Never evaluate or execute new trades inside a GET request!
     from app.socket.indexes import _shared_quotes
     from app.services.fno_prediction_service import INDEX_SPECS
+    from app.services.fno_autotrade_engine import resolve_live_option_premium
 
     docs = list(db.fno_autotrade_positions.find({"userId": uid, "status": "OPEN"}).sort("entryTime", -1))
     positions = []
@@ -189,19 +222,16 @@ def get_open_fno_positions():
         prev_high = float(d.get("highestPremium", entry_prem))
         prev_curr = float(d.get("currentPremium", entry_prem))
 
-        # Real-time repricing from live shared quotes
+        # Real-time repricing from live NSE Option Chain v3 & shared quotes
         und = d.get("underlying")
         spec = INDEX_SPECS.get(und, {})
         sym = spec.get("symbol")
         live_quote = _shared_quotes.get(sym, {}) if sym else {}
         live_ltp = float(live_quote.get("ltp", 0.0))
 
-        if live_ltp > 0 and entry_idx > 0:
-            idx_diff = live_ltp - entry_idx
-            prem_diff = delta * idx_diff if opt_type == "CE" else -delta * idx_diff
-            curr_prem = max(round(entry_prem + prem_diff, 2), 1.0)
-        else:
-            curr_prem = prev_curr
+        curr_prem, eff_idx_ltp = resolve_live_option_premium(d, live_index_ltp=live_ltp)
+        if eff_idx_ltp > 0:
+            live_ltp = eff_idx_ltp
 
         highest_prem = max(prev_high, curr_prem)
         default_init_sl = round(max(entry_prem - 10.0, entry_prem * 0.80), 2)
@@ -255,6 +285,7 @@ def get_open_fno_positions():
             "underlying": d["underlying"],
             "option_type": d["optionType"],
             "strike": float(d["strike"]),
+            "expiry": d.get("expiryDate", ""),
             "lots": int(d.get("lots", 1)),
             "lot_size": int(d.get("lotSize", 25)),
             "quantity": qty,
@@ -272,7 +303,7 @@ def get_open_fno_positions():
             "trade_mode": d.get("tradeMode", "paper"),
             "ai_confidence": d.get("aiConfidence", 75),
             "signal": d.get("signal", "CALL_BUY"),
-            "strategy_name": d.get("strategyName", "VWAP + Supertrend(7,3) + CPR Breakout + PCR OI Confluence"),
+            "strategy_name": d.get("strategyName", "VWAP + Supertrend(7,3) + CPR Breakout + NSE Option Chain OI"),
             "entry_reasons": d.get("entryReasons", []),
             "entry_time": entry_time_ist,
             "date_ist": entry_date_ist,
@@ -322,6 +353,7 @@ def get_fno_trade_history():
             "underlying": d.get("underlying"),
             "option_type": d.get("optionType"),
             "strike": d.get("strike"),
+            "expiry": d.get("expiryDate", ""),
             "lots": d.get("lots", 1),
             "quantity": d.get("quantity"),
             "entry_premium": d.get("entryPremium"),

@@ -169,6 +169,7 @@ def create_app(config_name=None):
             _mongo_db.paper_accounts.delete_many({})
             _mongo_db.paper_orders.delete_many({})
             _mongo_db.paper_positions.delete_many({})
+            _mongo_db.predictions.delete_many({})
 
             return jsonify({
                 "status": "success",
@@ -181,10 +182,26 @@ def create_app(config_name=None):
             logger.error(f"[system_reset_fresh] Error: {e}")
             return jsonify({"status": "failed", "error": str(e)}), 500
 
+    @app.route("/api/v1/live-quotes", methods=["GET"])
+    def get_live_nse_quotes():
+        """Returns real-time NSE India quotes for all major indices and equities."""
+        from app.socket.indexes import _shared_quotes, _quotes_lock, refresh_shared_quotes_from_nse
+        with _quotes_lock:
+            has_quotes = len(_shared_quotes) > 0
+        if not has_quotes:
+            refresh_shared_quotes_from_nse(include_equities=True)
+        with _quotes_lock:
+            quotes_copy = dict(_shared_quotes)
+        return jsonify({
+            "status": "success",
+            "source": "NSE_LIVE",
+            "count": len(quotes_copy),
+            "quotes": quotes_copy,
+        })
+
     @app.route("/api/v1/getAllHolding", methods=["GET"])
     def get_all_holding():
-        """Returns live equity holdings from the user's active connected broker (Angel One / Groww) or Paper Sandbox."""
-        from flask import request as req
+        """Returns live equity holdings from the user's active connected broker (Angel One / Groww) or Paper Account (zero static holdings)."""
         from app.socket.indexes import _shared_quotes, _quotes_lock
         from app.routes.broker_routes import _get_current_user
         from app.services.broker_providers import (
@@ -193,6 +210,7 @@ def create_app(config_name=None):
             get_broker_provider,
             token_crypto,
         )
+        from app.models.user import db as _mongo_db
 
         user_doc = _get_current_user()
         active_broker = "paper"
@@ -207,7 +225,6 @@ def create_app(config_name=None):
                 try:
                     provider = get_broker_provider(active_broker)
                     broker_holdings = provider.get_holdings(conn)
-                    # If connected via legacy sim callback, still ensure distinct broker portfolio rather than paper sandbox
                     if not broker_holdings:
                         access_tok = token_crypto.decrypt(conn.get("access_token_encrypted") or "")
                         if access_tok.startswith("angel_sim_") or access_tok.startswith("groww_sim_"):
@@ -235,33 +252,31 @@ def create_app(config_name=None):
         with _quotes_lock:
             quotes = dict(_shared_quotes)
 
-        base_holdings = [
-            {"symbol": "RELIANCE", "name": "Reliance Industries Ltd", "quantity": 50, "averagePrice": 1180.00, "sector": "Energy"},
-            {"symbol": "TCS", "name": "Tata Consultancy Services", "quantity": 30, "averagePrice": 2150.00, "sector": "IT"},
-            {"symbol": "ICICIBANK", "name": "ICICI Bank Ltd", "quantity": 100, "averagePrice": 1240.00, "sector": "Banking"},
-            {"symbol": "SBIN", "name": "State Bank of India", "quantity": 120, "averagePrice": 895.00, "sector": "Banking"},
-            {"symbol": "BHARTIARTL", "name": "Bharti Airtel Ltd", "quantity": 40, "averagePrice": 1690.00, "sector": "Telecom"},
-            {"symbol": "ITC", "name": "ITC Limited", "quantity": 200, "averagePrice": 242.00, "sector": "FMCG"},
-        ]
+        # Strictly return only real open paper positions for this user (no static dummy holdings)
         enriched = []
-        for h in base_holdings:
-            sym = h["symbol"]
-            q = quotes.get(f"{sym}.NS") or quotes.get(sym) or {}
-            ltp = round(float(q.get("ltp") or h["averagePrice"]), 2)
-            prev = round(float(q.get("prev") or ltp), 2)
-            chg = round(ltp - prev, 2)
-            p_chg = round((chg / prev) * 100, 2) if prev > 0 else 0.0
-            enriched.append({
-                "symbol": sym,
-                "name": h["name"],
-                "quantity": h["quantity"],
-                "averagePrice": h["averagePrice"],
-                "ltp": ltp,
-                "change": chg,
-                "pChange": p_chg,
-                "sector": h["sector"],
-                "broker": "paper",
-            })
+        if user_id:
+            open_docs = list(_mongo_db.autotrade_positions.find({"userId": user_id, "status": "OPEN"}))
+            for d in open_docs:
+                sym = d.get("symbol", "")
+                qty = int(d.get("quantity", 0))
+                avg_p = float(d.get("entryPrice", 0.0))
+                q = quotes.get(f"{sym}.NS") or quotes.get(sym) or {}
+                ltp = round(float(q.get("ltp") or d.get("currentPrice") or avg_p), 2)
+                prev = round(float(q.get("prev") or avg_p), 2)
+                chg = round(ltp - prev, 2)
+                p_chg = round((chg / prev) * 100, 2) if prev > 0 else 0.0
+                enriched.append({
+                    "symbol": sym,
+                    "name": q.get("name", sym),
+                    "quantity": qty,
+                    "averagePrice": avg_p,
+                    "ltp": ltp,
+                    "change": chg,
+                    "pChange": p_chg,
+                    "sector": "NSE Equity",
+                    "broker": "paper",
+                })
+
         return jsonify({
             "status": "success",
             "broker": "paper",
