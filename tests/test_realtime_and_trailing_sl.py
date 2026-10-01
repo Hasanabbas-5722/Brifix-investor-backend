@@ -175,9 +175,9 @@ def test_realtime_socket_streaming():
     def on_stocks(data):
         received_stocks.append(data)
 
-    print("🔌 Connecting to Socket.IO server at http://127.0.0.1:6001...")
+    print("🔌 Connecting to Socket.IO server at https://brifix-investor-backend.vercel.app...")
     try:
-        sio.connect('http://127.0.0.1:6001', transports=['polling', 'websocket'], wait_timeout=10)
+        sio.connect('https://brifix-investor-backend.vercel.app', transports=['polling', 'websocket'], wait_timeout=10)
         print("✅ Connected to Socket.IO successfully!")
     except Exception as e:
         print(f"❌ Could not connect to Socket.IO server: {e}")

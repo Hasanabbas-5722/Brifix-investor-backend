@@ -191,25 +191,15 @@ class AutoTradeEngine:
             sl_pct = float(cfg.get("stopLossPct", 1.5))
             initial_sl = float(pos.get("initialStopLossPrice", round(entry * (1 - sl_pct / 100.0), 2)))
 
-            # 1. Continuous Real-Time Smart Trailing Stop Loss:
-            # Whenever price increases by +X, Stop-Loss automatically increases by +X in real-time.
+            # 1. Point-for-Point 1:1 Smart Auto Trailing Stop Loss:
+            # Whatever amount increases from the entry/average price, increase the exact same in SL.
+            # Example: Entry=150, SL=140. If latest price rises to 160 (+10), SL increases to 150 (+10).
             new_sl = sl
             if trailing:
-                raw_gap = entry - initial_sl
-                risk_gap = max(raw_gap, 1.0) if raw_gap > 0 else round(entry * (sl_pct / 100.0), 2)
-
-                if highest > entry:
-                    sl_from_entry = round(initial_sl + (highest - entry), 2)
-                    new_sl = max(new_sl, sl_from_entry)
-
-                if highest > prev_high:
-                    sl_from_high_step = round(sl + (highest - prev_high), 2)
-                    new_sl = max(new_sl, sl_from_high_step)
-
-                if ltp > prev_curr or ltp > entry:
-                    sl_from_live_gap = round(ltp - risk_gap, 2)
-                    if sl_from_live_gap > new_sl:
-                        new_sl = sl_from_live_gap
+                gain_from_entry = max(0.0, highest - entry)
+                point_for_point_sl = round(initial_sl + gain_from_entry, 2)
+                # Ratchet: Stop-Loss only moves UP, never downwards
+                new_sl = max(sl, point_for_point_sl, initial_sl)
 
             # Update DB with latest LTP, highest price & trailing SL
             db.autotrade_positions.update_one(
@@ -222,11 +212,19 @@ class AutoTradeEngine:
                 }}
             )
 
-            # 2. Check ₹300+ Profit Target Hit (or Target Price Hit)
+            # 2. Check ₹300+ Profit Target Hit (or Target Price Hit) -> Auto Square-Off
             profit_target_inr = float(pos.get("profitTargetInr", cfg.get("profitTargetInr", 300.0)))
             current_pnl = round((ltp - entry) * qty, 2)
-            if current_pnl >= profit_target_inr or ltp >= target:
+            if current_pnl >= 300.0 or current_pnl >= profit_target_inr or ltp >= target:
                 self._close_position(pos, ltp, "PROFIT_300_TARGET_HIT")
+                continue
+
+            # Auto Square-Off IMMEDIATELY when loss reaches 100 points or ₹100 in this trade
+            max_loss_inr = float(pos.get("maxLossPerTradeInr", cfg.get("maxLossPerTradeInr", 100.0)))
+            points_loss = round(entry - ltp, 2)
+            if current_pnl <= -100.0 or current_pnl <= -max_loss_inr or points_loss >= 100.0:
+                reason = "LOSS_100_LIMIT_HIT" if (current_pnl <= -100.0 or current_pnl <= -max_loss_inr) else "LOSS_100_POINTS_HIT"
+                self._close_position(pos, ltp, reason)
                 continue
 
             # Anti-jitter hysteresis: protect positions for the first 5 seconds after entry
@@ -521,13 +519,14 @@ class AutoTradeEngine:
                     logger.warning(f"[AutoTradeEngine] Insufficient live margin for {uid}: needed Rs.{order_cost}, had Rs.{avail_cash}")
                     continue
 
-                # Calculate Risk-Reward parameters
-                sl_pct = float(cfg.get("stopLossPct", 1.5))
-                rr = float(cfg.get("riskRewardRatio", 3.0))
-                tp_pct = round(sl_pct * rr, 2)
+                # Calculate Risk-Reward parameters (capped at 100 loss points / ₹100 risk and 300+ profit)
+                profit_target_inr = float(cfg.get("profitTargetInr", 300.0))
+                max_loss_inr = float(cfg.get("maxLossPerTradeInr", 100.0))
 
-                sl_price = round(ltp * (1 - sl_pct / 100), 2)
-                target_price = round(ltp * (1 + tp_pct / 100), 2)
+                risk_pts = round(min(max_loss_inr / qty, 100.0), 2)
+                sl_price = round(max(0.05, ltp - risk_pts), 2)
+                target_pts = round(profit_target_inr / qty, 2)
+                target_price = round(ltp + target_pts, 2)
 
                 # Place BUY order through broker
                 buy_res = broker.place_order(sym, "BUY", qty, ltp)
@@ -552,6 +551,8 @@ class AutoTradeEngine:
                         "initialStopLossPrice": sl_price,
                         "stopLossPrice": sl_price,
                         "targetPrice": target_price,
+                        "profitTargetInr": profit_target_inr,
+                        "maxLossPerTradeInr": max_loss_inr,
                         "highestPrice": ltp,
                         "status": "OPEN",
                         "tradeMode": trade_mode,

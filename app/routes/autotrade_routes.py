@@ -174,22 +174,12 @@ def get_open_positions():
         initial_sl = float(d.get("initialStopLossPrice", round(entry * 0.985, 2)))
         stored_sl = float(d.get("stopLossPrice", initial_sl))
 
-        raw_gap = entry - initial_sl
-        risk_gap = max(raw_gap, 1.0) if raw_gap > 0 else round(entry * 0.015, 2)
-        live_sl = stored_sl
-
-        if highest > entry:
-            sl_from_entry = round(initial_sl + (highest - entry), 2)
-            live_sl = max(live_sl, sl_from_entry)
-
-        if highest > prev_high:
-            sl_from_high_step = round(stored_sl + (highest - prev_high), 2)
-            live_sl = max(live_sl, sl_from_high_step)
-
-        if ltp > prev_curr or ltp > entry:
-            sl_from_live_gap = round(ltp - risk_gap, 2)
-            if sl_from_live_gap > live_sl:
-                live_sl = sl_from_live_gap
+        # Point-for-Point 1:1 Smart Auto Trailing Stop Loss:
+        # Whatever amount increases from the entry/average price, increase the exact same in SL.
+        # Example: Entry=150, SL=140. If price rises to 160 (+10), SL increases to 150 (+10).
+        gain_from_entry = max(0.0, highest - entry)
+        point_for_point_sl = round(initial_sl + gain_from_entry, 2)
+        live_sl = max(stored_sl, point_for_point_sl, initial_sl)
 
         if (ltp != prev_curr) or (highest > prev_high) or (live_sl > stored_sl):
             try:

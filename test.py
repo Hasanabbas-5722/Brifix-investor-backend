@@ -91,7 +91,7 @@ from SmartApi import SmartConnect #or from SmartApi.smartConnect import SmartCon
 import pyotp
 from logzero import logger
 
-api_key = 'R2ogcWTx code'
+api_key = 'PjWePs8A code'
 username = "PRJR2770"
 pwd = '7860'
 smartApi = SmartConnect(api_key)

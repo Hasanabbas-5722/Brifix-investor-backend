@@ -30,8 +30,8 @@ def main():
     def on_stocks(data):
         received_stocks.append(data)
 
-    print("🔌 Connecting to Socket.IO server at http://127.0.0.1:6001...")
-    sio.connect('http://127.0.0.1:6001', transports=['polling', 'websocket'], wait_timeout=10)
+    print("🔌 Connecting to Socket.IO server at https://brifix-investor-backend.vercel.app...")
+    sio.connect('https://brifix-investor-backend.vercel.app', transports=['polling', 'websocket'], wait_timeout=10)
 
     # Subscribe to room 'indexes'
     print("📡 Emitting 'subscribe_indexes'...")

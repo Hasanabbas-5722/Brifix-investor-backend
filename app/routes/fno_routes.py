@@ -238,19 +238,12 @@ def get_open_fno_positions():
         sl_prem = float(d.get("stopLossPremium", default_init_sl))
         initial_sl_prem = float(d.get("initialStopLossPremium", min(sl_prem, default_init_sl)))
 
-        raw_gap = max(entry_prem - initial_sl_prem, entry_prem * 0.15, 5.0)
-        trail_gap = round(max(raw_gap, entry_prem * 0.20, 6.0), 2)
-        gain_from_entry = highest_prem - entry_prem
-
-        if gain_from_entry >= raw_gap:
-            breakeven_sl = round(entry_prem + max(1.0, entry_prem * 0.015), 2)
-            sl_prem = max(sl_prem, breakeven_sl)
-
-        if gain_from_entry >= (raw_gap * 1.2):
-            sl_from_trail = round(highest_prem - (trail_gap * 0.75), 2)
-            sl_prem = max(sl_prem, sl_from_trail)
-
-        sl_prem = max(sl_prem, initial_sl_prem)
+        # Point-for-Point 1:1 Smart Auto Trailing Stop Loss:
+        # Whatever amount increases from the entry/average price, increase the exact same in SL.
+        # Example: Entry=150, SL=140. If price rises to 160 (+10), SL increases to 150 (+10).
+        gain_from_entry = max(0.0, highest_prem - entry_prem)
+        point_for_point_sl = round(initial_sl_prem + gain_from_entry, 2)
+        sl_prem = max(sl_prem, point_for_point_sl, initial_sl_prem)
 
         if (curr_prem != prev_curr) or (highest_prem > prev_high) or (sl_prem > float(d.get("stopLossPremium", 0))):
             try:
@@ -275,6 +268,7 @@ def get_open_fno_positions():
         display_date_ist = d.get("displayDateIST") or format_ist_display_date(d.get("entryTime"))
 
         profit_target_inr = float(d.get("profitTargetInr", 300.0))
+        max_loss_inr = float(d.get("maxLossPerTradeInr", 100.0))
         default_tp_prem = round(entry_prem + (profit_target_inr / max(qty, 1)), 2)
 
         positions.append({
@@ -293,6 +287,7 @@ def get_open_fno_positions():
             "stop_loss_premium": sl_prem,
             "target_premium": float(d.get("targetPremium", default_tp_prem)),
             "profit_target_inr": profit_target_inr,
+            "max_loss_per_trade_inr": max_loss_inr,
             "highest_premium": highest_prem,
             "entry_index_price": entry_idx if entry_idx > 0 else live_ltp,
             "delta": delta,

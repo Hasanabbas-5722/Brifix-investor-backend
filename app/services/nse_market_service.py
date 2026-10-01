@@ -21,10 +21,12 @@ Zero random numbers, zero synthetic drift, zero hallucinated prices.
 import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 import requests
+from requests.adapters import HTTPAdapter
 
 from app.utils.logger import get_logger
 from app.utils.market_calendar import get_ist_time
@@ -50,8 +52,12 @@ class NSEMarketService:
         self._initialized = True
         self._session_lock = threading.Lock()
         self._cache_lock = threading.Lock()
+        self._thread_local = threading.local()
         self._session = self._create_session()
+        self._shared_cookies = {}
         self._cookie_ts = 0.0
+        self._executor = ThreadPoolExecutor(max_workers=8)
+        self._refreshing_chains = set()
 
         # Real-time in-memory caches (populated strictly from live NSE responses)
         self._indices_cache: Dict[str, dict] = {}
@@ -73,6 +79,9 @@ class NSEMarketService:
 
     def _create_session(self) -> requests.Session:
         s = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
         s.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -86,34 +95,44 @@ class NSEMarketService:
         })
         return s
 
+    def _get_thread_session(self) -> requests.Session:
+        sess = getattr(self._thread_local, "session", None)
+        if sess is None:
+            sess = self._create_session()
+            self._thread_local.session = sess
+        if self._shared_cookies:
+            sess.cookies.update(self._shared_cookies)
+        return sess
+
     def _ensure_cookies(self, force: bool = False):
         now = time.time()
-        if not force and self._session.cookies and (now - self._cookie_ts) < 180.0:
+        if not force and self._shared_cookies and (now - self._cookie_ts) < 180.0:
             return
         with self._session_lock:
-            if not force and self._session.cookies and (time.time() - self._cookie_ts) < 180.0:
+            if not force and self._shared_cookies and (time.time() - self._cookie_ts) < 180.0:
                 return
             try:
                 resp = self._session.get(
                     "https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY",
-                    timeout=6,
+                    timeout=4,
                 )
                 if resp.status_code == 200:
                     self._cookie_ts = time.time()
+                    self._shared_cookies = self._session.cookies.get_dict()
                     expiries = resp.json().get("expiryDates", [])
                     if expiries:
                         self._expiry_cache["NIFTY"] = (self._cookie_ts, expiries)
             except Exception as e:
                 logger.debug(f"[NSEMarketService] Cookie init warning: {e}")
 
-    def _get_json(self, url: str, params: dict = None, timeout: int = 6, need_cookies: bool = False, referer: str = None) -> Optional[dict]:
+    def _get_json(self, url: str, params: dict = None, timeout: int = 4, need_cookies: bool = False, referer: str = None) -> Optional[dict]:
         if need_cookies:
             self._ensure_cookies()
-        if referer:
-            self._session.headers['Referer'] = referer
+        req_headers = {"Referer": referer} if referer else None
         for attempt in range(2):
+            sess = self._get_thread_session()
             try:
-                resp = self._session.get(url, params=params, timeout=timeout)
+                resp = sess.get(url, params=params, headers=req_headers, timeout=timeout)
                 if resp.status_code == 200 and resp.text.strip():
                     return resp.json()
                 if resp.status_code in (401, 403):
@@ -139,7 +158,7 @@ class NSEMarketService:
     # 1. REAL NSE INDICES (`allIndices`)
     # ──────────────────────────────────────────────────────────────────────
 
-    def fetch_live_indices(self, max_age_sec: float = 2.5) -> Dict[str, dict]:
+    def fetch_live_indices(self, max_age_sec: float = 0.9) -> Dict[str, dict]:
         """
         Fetch live NSE Indices from `https://www.nseindia.com/api/allIndices`.
         Maps canonical keys:
@@ -152,7 +171,7 @@ class NSEMarketService:
         if self._indices_cache and (now - self._indices_ts) < max_age_sec:
             return dict(self._indices_cache)
 
-        data = self._get_json("https://www.nseindia.com/api/allIndices", timeout=6)
+        data = self._get_json("https://www.nseindia.com/api/allIndices", timeout=3.5)
         if not data or not isinstance(data.get("data"), list):
             return dict(self._indices_cache)
 
@@ -304,28 +323,32 @@ class NSEMarketService:
         self._record_real_tick(clean_sym, ltp, vol)
         return quote_obj
 
-    def fetch_live_stocks_and_movers(self, required_symbols: List[str] = None, max_age_sec: float = 4.0) -> Tuple[Dict[str, dict], List[dict], List[dict]]:
+    def fetch_live_stocks_and_movers(self, required_symbols: List[str] = None, max_age_sec: float = 1.2) -> Tuple[Dict[str, dict], List[dict], List[dict]]:
         """
-        Fetches 150+ real NSE stocks from `live-analysis-variations` (gainers + loosers),
-        and fills in any missing `required_symbols` via `GetQuoteApi`.
+        Fetches 150+ real NSE stocks from `live-analysis-variations` (gainers + loosers) in parallel,
+        and fills in any missing `required_symbols` concurrently via `GetQuoteApi`.
         Returns (stocks_dict, top_gainers, top_losers).
         """
         now = time.time()
         if self._stocks_cache and (now - self._stocks_ts) < max_age_sec:
             return dict(self._stocks_cache), list(self._gainers_cache), list(self._losers_cache)
 
-        gainers_js = self._get_json(
+        fut_g = self._executor.submit(
+            self._get_json,
             "https://www.nseindia.com/api/live-analysis-variations",
-            params={"index": "gainers"},
-            timeout=6,
-            need_cookies=True,
+            {"index": "gainers"},
+            4,
+            True,
         )
-        losers_js = self._get_json(
+        fut_l = self._executor.submit(
+            self._get_json,
             "https://www.nseindia.com/api/live-analysis-variations",
-            params={"index": "loosers"},
-            timeout=6,
-            need_cookies=True,
+            {"index": "loosers"},
+            4,
+            True,
         )
+        gainers_js = fut_g.result()
+        losers_js = fut_l.result()
 
         parsed_stocks: Dict[str, dict] = {}
         nifty_gainers: List[dict] = []
@@ -377,20 +400,32 @@ class NSEMarketService:
                             elif not is_gainer and q["pChange"] < 0:
                                 nifty_losers.append(q)
 
-        # Fetch any core/watchlist symbols that were not in the gainers/losers variation buckets
+        # Fetch any core/watchlist symbols concurrently in parallel if not in gainers/losers buckets
         if required_symbols:
+            missing_to_fetch = []
             for req_sym in required_symbols:
                 clean = req_sym.replace(".NS", "").replace(".BO", "").strip().upper()
                 if clean and not clean.startswith("^") and clean not in parsed_stocks:
                     existing = self._stocks_cache.get(clean)
-                    if existing and (time.time() - existing.get("updated_at", 0)) < 25.0:
+                    if existing and (time.time() - existing.get("updated_at", 0)) < 2.5:
                         parsed_stocks[clean] = existing
                         parsed_stocks[f"{clean}.NS"] = existing
                     else:
-                        q_single = self.fetch_single_equity_quote(clean)
+                        missing_to_fetch.append(clean)
+
+            if missing_to_fetch:
+                futures = {sym: self._executor.submit(self.fetch_single_equity_quote, sym) for sym in set(missing_to_fetch)}
+                for sym, fut in futures.items():
+                    try:
+                        q_single = fut.result(timeout=3.5)
                         if q_single:
-                            parsed_stocks[clean] = q_single
-                            parsed_stocks[f"{clean}.NS"] = q_single
+                            parsed_stocks[sym] = q_single
+                            parsed_stocks[f"{sym}.NS"] = q_single
+                    except Exception:
+                        existing = self._stocks_cache.get(sym)
+                        if existing:
+                            parsed_stocks[sym] = existing
+                            parsed_stocks[f"{sym}.NS"] = existing
 
         if parsed_stocks:
             all_unique = [v for k, v in parsed_stocks.items() if not k.endswith(".NS")]
@@ -416,11 +451,28 @@ class NSEMarketService:
     # 3. REAL NSE OPTION CHAIN V3 (`NIFTY`, `BANKNIFTY`, `FINNIFTY`)
     # ──────────────────────────────────────────────────────────────────────
 
-    def get_index_option_chain(self, index_key: str, max_age_sec: float = 4.0) -> Optional[dict]:
+    def prewarm_all_option_chains(self, max_age_sec: float = 2.0):
+        """Concurrently refresh all 3 index option chains in background threads."""
+        now = time.time()
+        for key in ("NIFTY", "BANKNIFTY", "FINNIFTY"):
+            cached_ts = self._option_chain_ts.get(key, 0.0)
+            if (now - cached_ts) >= max_age_sec and key not in self._refreshing_chains:
+                self._refreshing_chains.add(key)
+                self._executor.submit(self._refresh_chain_worker, key)
+
+    def _refresh_chain_worker(self, clean_key: str):
+        try:
+            self.get_index_option_chain(clean_key, max_age_sec=0.0, force_sync=True)
+        except Exception as e:
+            logger.debug(f"[NSEMarketService] Option chain worker warning for {clean_key}: {e}")
+        finally:
+            self._refreshing_chains.discard(clean_key)
+
+    def get_index_option_chain(self, index_key: str, max_age_sec: float = 2.0, force_sync: bool = False) -> Optional[dict]:
         """
         Fetches real-time NSE Option Chain for `NIFTY`, `BANKNIFTY`, or `FINNIFTY`
         using `option-chain-contract-info` + `option-chain-v3`.
-        Automatically selects the active/nearest tradable expiry where ATM options have real liquidity.
+        When a cached chain already exists, returns immediately (<1ms) and triggers background refresh if stale.
         """
         clean_key = index_key.strip().upper()
         if clean_key not in ("NIFTY", "BANKNIFTY", "FINNIFTY"):
@@ -429,7 +481,10 @@ class NSEMarketService:
         now = time.time()
         cached = self._option_chain_cache.get(clean_key)
         cached_ts = self._option_chain_ts.get(clean_key, 0.0)
-        if cached and (now - cached_ts) < max_age_sec:
+        if cached and not force_sync:
+            if (now - cached_ts) >= max_age_sec and clean_key not in self._refreshing_chains:
+                self._refreshing_chains.add(clean_key)
+                self._executor.submit(self._refresh_chain_worker, clean_key)
             return cached
 
         # 1. Get contract expiry dates

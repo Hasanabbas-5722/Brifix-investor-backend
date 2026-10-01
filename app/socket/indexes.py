@@ -218,21 +218,27 @@ def refresh_shared_quotes_from_nse(max_age_sec: float = 2.5) -> dict:
 
 
 def _run_quote_updater():
-    """Background worker that refreshes real NSE India quotes every 3 seconds."""
-    logger.info("Starting real-time NSE India market quote updater...")
+    """Background worker that refreshes real NSE India quotes & Option Chains every 1 second."""
+    from app.services.nse_market_service import nse_market_service
+    logger.info("Starting 1-second real-time NSE India market & option-chain updater...")
+    cycle = 0
     while _fallback_feeder_running:
         try:
-            refresh_shared_quotes_from_nse(max_age_sec=2.5)
+            refresh_shared_quotes_from_nse(max_age_sec=0.85)
+            if cycle % 2 == 0:
+                nse_market_service.prewarm_all_option_chains(max_age_sec=1.8)
+            cycle += 1
         except Exception as e:
             logger.debug(f"NSE quote updater error: {e}")
-        time.sleep(3.0)
+        time.sleep(1.0)
 
 
 def _run_index_feeder():
-    """Real-time NSE tick broadcaster emitting authentic NSE prices every 1s with zero synthetic drift."""
+    """Real-time NSE tick broadcaster emitting authentic NSE prices & Option LTPs every 1s."""
     global _fallback_feeder_running
     import eventlet
     from app.services.realtime_candle_manager import realtime_candle_manager
+    from app.services.nse_market_service import nse_market_service
 
     logger.info("Starting real-time NSE market broadcaster (1s cadence, zero synthetic drift)...")
 
@@ -253,7 +259,7 @@ def _run_index_feeder():
                     current_quotes = dict(_shared_quotes)
 
                 if not current_quotes:
-                    current_quotes = refresh_shared_quotes_from_nse(max_age_sec=2.5)
+                    current_quotes = refresh_shared_quotes_from_nse(max_age_sec=0.85)
 
                 # Build target list
                 stock_list = list(CORE_STOCKS)
@@ -298,6 +304,7 @@ def _run_index_feeder():
                         "is_market_open": is_market_open,
                         "market_status": session_info.get("status", "CLOSED"),
                         "source": "NSE_LIVE",
+                        "timestamp_ms": int(now_ts * 1000),
                         "full_data": {
                             "last_traded_price": round(ltp * 100),
                             "closed_price": round(prev * 100),
@@ -342,6 +349,43 @@ def _run_index_feeder():
                             _tick_eval_queue.put_nowait((is_index, ticker_sym if is_index else token_id, ltp))
                         except Exception:
                             pass
+
+                # Emit real-time F&O Option Chain LTP snapshot every 1s to room 'indexes'
+                fno_opt_ticks = {}
+                for idx_k in ("NIFTY", "BANKNIFTY", "FINNIFTY"):
+                    chain = nse_market_service._option_chain_cache.get(idx_k)
+                    if chain:
+                        u_ltp = float((current_quotes.get(idx_k) or {}).get("ltp") or chain.get("underlying_ltp") or 0.0)
+                        step = 100 if idx_k == "BANKNIFTY" else 50
+                        atm = int(round(u_ltp / step) * step) if u_ltp > 0 else 0
+                        s_map = chain.get("strikes") or {}
+                        atm_row = s_map.get(atm) or s_map.get(str(atm)) or {}
+                        ce_obj = atm_row.get("CE") or {}
+                        pe_obj = atm_row.get("PE") or {}
+                        nearby_strikes = {}
+                        for k_strike, row_val in s_map.items():
+                            try:
+                                ks_int = int(float(k_strike))
+                                if atm == 0 or abs(ks_int - atm) <= step * 6:
+                                    nearby_strikes[str(ks_int)] = row_val
+                            except Exception:
+                                pass
+                        fno_opt_ticks[idx_k] = {
+                            "underlying": idx_k,
+                            "underlying_ltp": u_ltp,
+                            "spot_ltp": u_ltp,
+                            "atm_strike": atm,
+                            "expiry": chain.get("expiry", ""),
+                            "pcr": chain.get("pcr", 1.0),
+                            "ce_ltp": float(ce_obj.get("ltp") or 0.0),
+                            "pe_ltp": float(pe_obj.get("ltp") or 0.0),
+                            "ce_iv": float(ce_obj.get("iv") or 0.0),
+                            "pe_iv": float(pe_obj.get("iv") or 0.0),
+                            "strikes": nearby_strikes,
+                            "timestamp_ms": int(now_ts * 1000),
+                        }
+                if fno_opt_ticks:
+                    socketio.emit("fno_option_ticks", fno_opt_ticks, room='indexes')
 
                 # Emit top gainers & losers to room 'indexes' every 1s
                 if stock_movers:

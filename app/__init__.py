@@ -85,6 +85,159 @@ def create_app(config_name=None):
                 "market_status": [{"market": "Capital Market", "marketStatus": "Closed"}]
             })
 
+    @app.route("/api/v1/realtime/snapshot", methods=["GET"])
+    def realtime_market_snapshot():
+        """
+        Unified 1-Second Real-Time Market Snapshot Endpoint.
+        Returns live NSE Indices, Core/Watchlist Equities, Top Movers, and F&O Option Chain LTPs
+        in a single sub-20ms response. Also ensures serverless (Vercel) compatibility when WebSockets are unavailable.
+        """
+        import time as _time
+        from flask import request as _req
+        from app.socket.indexes import (
+            get_market_session_info,
+            refresh_shared_quotes_from_nse,
+            INDEX_TARGETS,
+            CORE_STOCKS,
+            _shared_quotes,
+            _quotes_lock,
+            register_dynamic_symbol,
+        )
+        from app.services.nse_market_service import nse_market_service
+
+        extra_syms_raw = _req.args.get("symbols", "")
+        if extra_syms_raw:
+            for s in extra_syms_raw.split(","):
+                if s.strip():
+                    register_dynamic_symbol(s.strip().upper())
+
+        session = get_market_session_info()
+        is_open = session.get("is_open", False)
+        is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+        with _quotes_lock:
+            quotes = dict(_shared_quotes)
+
+        # If serverless or cache cold, refresh with 0.85s max_age
+        if not quotes or is_serverless:
+            quotes = refresh_shared_quotes_from_nse(max_age_sec=0.85)
+            nse_market_service.prewarm_all_option_chains(max_age_sec=2.0)
+
+        now_ms = int(_time.time() * 1000)
+        indices_out = []
+        for ticker_sym, token_id, display_name in INDEX_TARGETS:
+            q = quotes.get(ticker_sym) or quotes.get(token_id) or quotes.get(display_name)
+            if not q or float(q.get("ltp") or 0) <= 0:
+                continue
+            ltp = round(float(q["ltp"]), 2)
+            prev = round(float(q.get("prev") or ltp), 2)
+            open_p = round(float(q.get("open") or prev), 2)
+            high_p = round(float(q.get("high") or max(ltp, open_p)), 2)
+            low_p = round(float(q.get("low") or min(ltp, open_p)), 2)
+            change = round(ltp - prev, 2)
+            p_change = round((change / prev * 100.0), 2) if prev > 0 else 0.0
+            indices_out.append({
+                "token": token_id,
+                "symbol": display_name,
+                "ticker": ticker_sym,
+                "ltp": ltp,
+                "change": change,
+                "pChange": p_change,
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "prevClose": prev,
+                "is_market_open": is_open,
+                "market_status": session.get("status", "CLOSED"),
+                "timestamp_ms": now_ms,
+            })
+
+        stocks_out = {}
+        for k, q in quotes.items():
+            if k.endswith(".NS") or k.startswith("^") or k in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "NIFTY 50", "BANK NIFTY", "FIN NIFTY", "INDIAVIX"):
+                continue
+            ltp = float(q.get("ltp") or 0.0)
+            if ltp <= 0:
+                continue
+            prev = float(q.get("prev") or ltp)
+            open_p = float(q.get("open") or prev)
+            high_p = float(q.get("high") or max(ltp, open_p))
+            low_p = float(q.get("low") or min(ltp, open_p))
+            change = round(ltp - prev, 2)
+            p_change = round((change / prev * 100.0), 2) if prev > 0 else 0.0
+            stocks_out[k] = {
+                "token": k,
+                "symbol": k,
+                "ltp": round(ltp, 2),
+                "change": change,
+                "pChange": p_change,
+                "open": round(open_p, 2),
+                "high": round(high_p, 2),
+                "low": round(low_p, 2),
+                "prevClose": round(prev, 2),
+                "vol": int(q.get("vol") or 0),
+                "is_market_open": is_open,
+                "timestamp_ms": now_ms,
+            }
+
+        fno_opt_ticks = {}
+        for idx_k in ("NIFTY", "BANKNIFTY", "FINNIFTY"):
+            chain = nse_market_service._option_chain_cache.get(idx_k)
+            if not chain and is_serverless:
+                chain = nse_market_service.get_index_option_chain(idx_k, max_age_sec=3.0)
+            if chain:
+                u_ltp = float((quotes.get(idx_k) or {}).get("ltp") or chain.get("underlying_ltp") or 0.0)
+                step = 100 if idx_k == "BANKNIFTY" else 50
+                atm = int(round(u_ltp / step) * step) if u_ltp > 0 else 0
+                s_map = chain.get("strikes") or {}
+                atm_row = s_map.get(atm) or s_map.get(str(atm)) or {}
+                ce_obj = atm_row.get("CE") or {}
+                pe_obj = atm_row.get("PE") or {}
+                nearby_strikes = {}
+                for k_strike, row_val in s_map.items():
+                    try:
+                        ks_int = int(float(k_strike))
+                        if atm == 0 or abs(ks_int - atm) <= step * 6:
+                            nearby_strikes[str(ks_int)] = row_val
+                    except Exception:
+                        pass
+                fno_opt_ticks[idx_k] = {
+                    "underlying": idx_k,
+                    "underlying_ltp": u_ltp,
+                    "spot_ltp": u_ltp,
+                    "atm_strike": atm,
+                    "expiry": chain.get("expiry", ""),
+                    "pcr": chain.get("pcr", 1.0),
+                    "ce_ltp": float(ce_obj.get("ltp") or 0.0),
+                    "pe_ltp": float(pe_obj.get("ltp") or 0.0),
+                    "ce_iv": float(ce_obj.get("iv") or 0.0),
+                    "pe_iv": float(pe_obj.get("iv") or 0.0),
+                    "strikes": nearby_strikes,
+                    "timestamp_ms": now_ms,
+                }
+
+        all_stock_list = list(stocks_out.values())
+        gainers = sorted(all_stock_list, key=lambda x: x["pChange"], reverse=True)[:5]
+        losers = sorted(all_stock_list, key=lambda x: x["pChange"])[:5]
+
+        snapshot_payload = {
+            "timestamp_ms": now_ms,
+            "is_serverless": is_serverless,
+            "market_status": session,
+            "indices": indices_out,
+            "stocks": all_stock_list,
+            "stocks_map": stocks_out,
+            "fno_option_ticks": fno_opt_ticks,
+            "gainers": gainers,
+            "losers": losers,
+        }
+        return jsonify({
+            "success": True,
+            "status": "success",
+            "data": snapshot_payload,
+            **snapshot_payload,
+        })
+
     # Initialize MongoDB
     extensions.connect_to_mongodb()
     logger.info("mongodb connected succesfully ")
@@ -101,6 +254,7 @@ def create_app(config_name=None):
         brokers_api_bp,
         portfolio_api_bp,
         orders_api_bp,
+        angel_bp,
     )
     from .routes.autotrade_routes import autotrade_bp
     from .routes.fno_routes import fno_bp
@@ -115,6 +269,7 @@ def create_app(config_name=None):
     app.register_blueprint(predict_bp)
     app.register_blueprint(groww)
     app.register_blueprint(broker_bp)
+    app.register_blueprint(angel_bp)
     app.register_blueprint(brokers_api_bp)
     app.register_blueprint(brokers_api_bp, name="brokers_api_v1", url_prefix="/api/v1/brokers")
     app.register_blueprint(portfolio_api_bp)
@@ -125,14 +280,16 @@ def create_app(config_name=None):
     app.register_blueprint(fno_bp)
 
     if config_name != "testing":
-        # Ensure all auto-trade switches start OFF on server boot so trades NEVER execute unless the user explicitly clicks Start Auto Trade
-        try:
-            from app.models.user import db as _mongo_db
-            _mongo_db.autotrade_configs.update_many({}, {"$set": {"enabled": False}})
-            _mongo_db.fno_autotrade_configs.update_many({}, {"$set": {"enabled": False}})
-            logger.info("[OK] Reset all Auto Stock & Auto F&O switches to disabled on startup (requires explicit user Start).")
-        except Exception as _reset_err:
-            logger.warning(f"Could not reset auto-trade switches on startup: {_reset_err}")
+        is_serverless_env = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+        if not is_serverless_env:
+            # Ensure all auto-trade switches start OFF on persistent server boot so trades NEVER execute unless the user explicitly clicks Start Auto Trade
+            try:
+                from app.models.user import db as _mongo_db
+                _mongo_db.autotrade_configs.update_many({}, {"$set": {"enabled": False}})
+                _mongo_db.fno_autotrade_configs.update_many({}, {"$set": {"enabled": False}})
+                logger.info("[OK] Reset all Auto Stock & Auto F&O switches to disabled on startup (requires explicit user Start).")
+            except Exception as _reset_err:
+                logger.warning(f"Could not reset auto-trade switches on startup: {_reset_err}")
 
         # Start automated trading background engines
         autotrade_engine.start()
